@@ -9,9 +9,9 @@ func TestIsValidAWSAccountID(t *testing.T) {
 	}{
 		{"111111111111", true},
 		{"000000000000", true},
-		{"12345", false},      // too short
+		{"12345", false},         // too short
 		{"1234567890123", false}, // too long
-		{"abcdefghijkl", false}, // not digits
+		{"abcdefghijkl", false},  // not digits
 		{"", false},
 		{"3516-1975-9866", false},
 	}
@@ -33,8 +33,8 @@ func TestIsValidRoleARN(t *testing.T) {
 		{"arn:aws:iam::111111111111:role/path/role-name", true},
 		{"arn:aws-us-gov:iam::111111111111:role/gov-role", true},
 		{"arn:aws-cn:iam::111111111111:role/cn-role", true},
-		{"arn:aws:iam::abc:role/foo", false},      // non-digit account
-		{"arn:aws:iam:::role/no-account", false},  // missing account
+		{"arn:aws:iam::abc:role/foo", false},          // non-digit account
+		{"arn:aws:iam:::role/no-account", false},      // missing account
 		{"arn:aws:iam::111111111111:user/foo", false}, // wrong resource type
 		{"arn:aws:iam::111111111111:role/", false},    // empty role name
 		{"111111111111:role/foo", false},              // no arn prefix
@@ -105,8 +105,8 @@ func TestAccountIDFromARN(t *testing.T) {
 func TestCrossFieldARNAccountMatch(t *testing.T) {
 	const submittedAccount = "111111111111"
 	cases := []struct {
-		name      string
-		arn       string
+		name        string
+		arn         string
 		shouldMatch bool
 	}{
 		{"matches", "arn:aws:iam::111111111111:role/portal", true},
