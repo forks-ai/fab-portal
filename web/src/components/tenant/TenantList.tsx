@@ -3,33 +3,14 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/api/client";
 import { useAuth } from "@/hooks/useAuth";
 import type { Cluster, Tenant } from "@/api/types";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Spinner } from "@/components/ui/spinner";
+import { SkeletonRows } from "@/components/ui/skeleton";
 import { Link } from "@/components/ui/link";
 import { formatRelativeTime } from "@/lib/utils";
 import { Boxes, Plus } from "lucide-react";
 import { TenantCreateModal } from "./TenantCreateModal";
-
-export function phaseBadge(phase: string) {
-  switch (phase.toLowerCase()) {
-    case "ready":
-    case "active":
-    case "healthy":
-      return <Badge variant="success">{phase}</Badge>;
-    case "pending":
-    case "provisioning":
-      return <Badge variant="default">{phase}</Badge>;
-    case "error":
-    case "failed":
-    case "degraded":
-      return <Badge variant="destructive">{phase}</Badge>;
-    case "":
-      return <Badge variant="secondary">Unknown</Badge>;
-    default:
-      return <Badge variant="secondary">{phase}</Badge>;
-  }
-}
+import { StatusBadge } from "@/components/ui/status-badge";
+import { tenantPhase } from "@/lib/status";
 
 export function TenantList() {
   const { user } = useAuth();
@@ -69,24 +50,6 @@ export function TenantList() {
     },
   });
 
-  if (isLoading) {
-    return (
-      <div className="flex justify-center py-20">
-        <Spinner className="w-6 h-6 text-primary" />
-      </div>
-    );
-  }
-
-  if (isError) {
-    return (
-      <div className="p-6">
-        <div className="bg-destructive/8 text-destructive border border-destructive/15 rounded-lg p-4 text-sm">
-          Failed to load tenants.
-        </div>
-      </div>
-    );
-  }
-
   const tenants = data?.data ?? [];
   const clusterName = (id: string) =>
     clusters?.find((c: Cluster) => c.id === id)?.name ?? id;
@@ -98,7 +61,7 @@ export function TenantList() {
   }, {});
 
   return (
-    <div className="p-6">
+    <div className="p-6 flex flex-col flex-1">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-lg font-semibold tracking-tight">Tenants</h1>
@@ -119,8 +82,16 @@ export function TenantList() {
         )}
       </div>
 
-      {tenants.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-20 text-center animate-fade-up">
+      {isLoading ? (
+        <SkeletonRows />
+      ) : isError ? (
+        <div className="flex-1 flex flex-col items-center justify-center">
+          <div className="bg-destructive/8 text-destructive border border-destructive/15 rounded-lg p-4 text-sm">
+            Failed to load tenants.
+          </div>
+        </div>
+      ) : tenants.length === 0 ? (
+        <div className="flex-1 flex flex-col items-center justify-center text-center animate-fade-up">
           <div className="w-12 h-12 rounded-lg bg-primary/8 flex items-center justify-center mb-4">
             <Boxes className="w-5 h-5 text-primary/60" />
           </div>
@@ -157,7 +128,7 @@ export function TenantList() {
                             <span className="text-sm font-medium group-hover:text-primary transition-colors">
                               {t.name}
                             </span>
-                            {phaseBadge(t.phase)}
+                            <StatusBadge visual={tenantPhase(t.phase)} />
                           </div>
                         </div>
                       </div>

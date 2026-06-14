@@ -16,25 +16,6 @@ export function formatRelativeTime(date: string | Date): string {
   return `${Math.floor(seconds / 86400)}d ago`;
 }
 
-export function getStatusColor(status: string): string {
-  switch (status) {
-    case "applied":
-      return "text-success";
-    case "planned":
-      return "text-primary";
-    case "planning":
-    case "applying":
-    case "queued":
-      return "text-warning";
-    case "errored":
-      return "text-destructive";
-    case "pending":
-      return "text-muted-foreground";
-    default:
-      return "text-muted-foreground";
-  }
-}
-
 export function formatDuration(startedAt?: string | null, finishedAt?: string | null): string {
   if (!startedAt) return "";
   const start = new Date(startedAt).getTime();
@@ -50,13 +31,16 @@ export function formatDuration(startedAt?: string | null, finishedAt?: string | 
   return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
 }
 
+// Environment hues stay intentionally distinct, but token-backed so they track
+// the theme: production reads as danger, staging as caution, everything else
+// (dev) as the neutral brand colour.
 export function getEnvironmentColor(env: string): string {
   switch (env) {
     case "production":
-      return "bg-red-500/10 text-red-400 border-red-500/20";
+      return "bg-destructive/10 text-destructive border-destructive/20";
     case "staging":
-      return "bg-yellow-500/10 text-yellow-400 border-yellow-500/20";
+      return "bg-warning/10 text-warning border-warning/20";
     default:
-      return "bg-blue-500/10 text-blue-400 border-blue-500/20";
+      return "bg-primary/10 text-primary border-primary/20";
   }
 }

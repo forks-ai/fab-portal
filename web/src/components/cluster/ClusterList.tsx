@@ -3,72 +3,17 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/api/client";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Spinner } from "@/components/ui/spinner";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { clusterConnection, argo } from "@/lib/status";
+import { SkeletonRows } from "@/components/ui/skeleton";
 import { Link } from "@/components/ui/link";
 import { formatRelativeTime } from "@/lib/utils";
-import type { Account, Cluster, ClusterConnectionStatus, ClusterOperation } from "@/api/types";
+import type { Account, Cluster, ClusterOperation } from "@/api/types";
 import { Server, Plus, Cloud } from "lucide-react";
 import { ClusterCreateModal } from "./ClusterCreateModal";
-import { ClusterOrderModal } from "./ClusterOrderModal";
+import { ClusterProvisionDrawer } from "./ClusterProvisionDrawer";
 import { VendTimeline } from "./VendTimeline";
 import { DeprovisionTimeline } from "./DeprovisionTimeline";
-
-export function statusBadge(status: ClusterConnectionStatus) {
-  switch (status) {
-    case "connected":
-      return <Badge variant="success">Connected</Badge>;
-    case "connecting":
-      return <Badge variant="default">Connecting</Badge>;
-    case "failed":
-      return <Badge variant="destructive">Failed</Badge>;
-    default:
-      return <Badge variant="secondary">Pending</Badge>;
-  }
-}
-
-type BadgeVariant = "success" | "warning" | "destructive" | "secondary";
-
-// argoBadge folds the per-cluster ArgoCD Application's sync + health into one
-// badge whose colour follows health (Progressing is the transitional/warning
-// state, matching the rest of the UI). Returns null when the watcher hasn't
-// observed a per-cluster Application — so it renders nothing for hand-registered
-// clusters or before the first health tick.
-export function argoBadge(sync: string, health: string) {
-  if (!sync && !health) return null;
-  const variant: BadgeVariant =
-    health === "Healthy"
-      ? "success"
-      : health === "Progressing"
-        ? "warning"
-        : health === "Degraded" || health === "Missing"
-          ? "destructive"
-          : sync === "OutOfSync"
-            ? "warning"
-            : "secondary";
-  const label = [sync, health].filter(Boolean).join(" · ");
-  return <Badge variant={variant}>{label}</Badge>;
-}
-
-// controlPlaneBadge renders the EKS control-plane lifecycle from
-// eks:DescribeCluster. Returns null when not observed (non-EKS, or describe not
-// permitted yet).
-export function controlPlaneBadge(status: string) {
-  if (!status) return null;
-  const titled = status.charAt(0) + status.slice(1).toLowerCase();
-  switch (status) {
-    case "ACTIVE":
-      return <Badge variant="success">{titled}</Badge>;
-    case "UPDATING":
-    case "CREATING":
-      return <Badge variant="warning">{titled}</Badge>;
-    case "DEGRADED":
-    case "FAILED":
-      return <Badge variant="destructive">{titled}</Badge>;
-    default:
-      return <Badge variant="secondary">{titled}</Badge>;
-  }
-}
 
 export function ClusterList() {
   const { user } = useAuth();
@@ -157,27 +102,16 @@ export function ClusterList() {
     if (opsPage > maxOpsPage) setOpsPage(maxOpsPage);
   }, [maxOpsPage, opsPage]);
 
-  if (isLoading) {
-    return (
-      <div className="flex justify-center py-20">
-        <Spinner className="w-6 h-6 text-primary" />
-      </div>
-    );
-  }
-
-  if (isError) {
-    return (
-      <div className="p-6">
-        <div className="bg-destructive/8 text-destructive border border-destructive/15 rounded-lg p-4 text-sm">
-          Failed to load clusters.
-        </div>
-      </div>
-    );
-  }
-
   const clusters = data?.data ?? [];
   const accountName = (id: string) =>
     accounts?.find((a: Account) => a.id === id)?.name ?? id;
+
+  // The "Recent orders" section below always renders when orders exist (e.g. a
+  // vend in flight before its cluster registers). When it does, the sparse
+  // states top-align (py-16) so they don't greedily center and shove the orders
+  // below the fold; with nothing below, they center in the full height.
+  const hasOrders = !!operations && operations.length > 0;
+  const sparseLayout = hasOrders ? "py-16" : "flex-1";
 
   return (
     <div className="p-6 flex flex-col flex-1">
@@ -211,8 +145,16 @@ export function ClusterList() {
         )}
       </div>
 
-      {clusters.length === 0 ? (
-        <div className="flex-1 flex flex-col items-center justify-center text-center animate-fade-up">
+      {isLoading ? (
+        <SkeletonRows />
+      ) : isError ? (
+        <div className={`${sparseLayout} flex flex-col items-center justify-center`}>
+          <div className="bg-destructive/8 text-destructive border border-destructive/15 rounded-lg p-4 text-sm">
+            Failed to load clusters.
+          </div>
+        </div>
+      ) : clusters.length === 0 ? (
+        <div className={`${sparseLayout} flex flex-col items-center justify-center text-center animate-fade-up`}>
           <div className="w-12 h-12 rounded-lg bg-primary/8 flex items-center justify-center mb-4">
             <Server className="w-5 h-5 text-primary/60" />
           </div>
@@ -256,8 +198,13 @@ export function ClusterList() {
                       <span className="text-sm font-medium group-hover:text-primary transition-colors">
                         {c.name}
                       </span>
-                      {statusBadge(c.connection_status)}
-                      {argoBadge(c.argocd_sync_status, c.argocd_health_status)}
+                      <StatusBadge visual={clusterConnection(c.connection_status)} />
+                      <StatusBadge
+                        visual={argo(
+                          c.argocd_sync_status,
+                          c.argocd_health_status,
+                        )}
+                      />
                     </div>
                     <p className="text-[11px] text-muted-foreground/70 mt-0.5">
                       {accountName(c.account_id)} · {c.region}
@@ -351,7 +298,7 @@ export function ClusterList() {
         accounts={accounts ?? []}
       />
 
-      <ClusterOrderModal
+      <ClusterProvisionDrawer
         open={showOrder}
         onClose={() => setShowOrder(false)}
         accounts={accounts ?? []}

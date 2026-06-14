@@ -9,8 +9,13 @@ import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Link } from "@/components/ui/link";
 import { formatRelativeTime } from "@/lib/utils";
-import { statusBadge, argoBadge, controlPlaneBadge } from "./ClusterList";
-import { phaseBadge } from "../tenant/TenantList";
+import { StatusBadge } from "@/components/ui/status-badge";
+import {
+  clusterConnection,
+  argo,
+  controlPlane,
+  tenantPhase,
+} from "@/lib/status";
 import {
   ArrowLeft,
   Server,
@@ -148,7 +153,7 @@ export function ClusterDetail({ clusterId }: { clusterId: string }) {
 
   if (isLoading) {
     return (
-      <div className="flex justify-center py-20">
+      <div className="flex-1 flex items-center justify-center">
         <Spinner className="w-6 h-6 text-primary" />
       </div>
     );
@@ -156,7 +161,7 @@ export function ClusterDetail({ clusterId }: { clusterId: string }) {
 
   if (isError || !data) {
     return (
-      <div className="p-6">
+      <div className="flex-1 flex flex-col items-center justify-center">
         <div className="bg-destructive/8 text-destructive border border-destructive/15 rounded-lg p-4 text-sm">
           Failed to load cluster.
         </div>
@@ -191,8 +196,13 @@ export function ClusterDetail({ clusterId }: { clusterId: string }) {
               <h1 className="text-lg font-semibold tracking-tight">
                 {data.name}
               </h1>
-              {statusBadge(data.connection_status)}
-              {argoBadge(data.argocd_sync_status, data.argocd_health_status)}
+              <StatusBadge visual={clusterConnection(data.connection_status)} />
+              <StatusBadge
+                visual={argo(
+                  data.argocd_sync_status,
+                  data.argocd_health_status,
+                )}
+              />
             </div>
             <p className="text-[12px] text-muted-foreground mt-0.5">
               {data.region}
@@ -300,7 +310,7 @@ export function ClusterDetail({ clusterId }: { clusterId: string }) {
             hint="EKS control-plane lifecycle, observed from AWS."
           >
             <div className="flex items-center gap-2">
-              {controlPlaneBadge(data.control_plane_status)}
+              <StatusBadge visual={controlPlane(data.control_plane_status)} />
               {data.platform_version && (
                 <span className="text-xs text-muted-foreground/70 font-mono">
                   {data.platform_version}
@@ -395,7 +405,7 @@ export function ClusterDetail({ clusterId }: { clusterId: string }) {
                   <span className="text-sm font-medium group-hover:text-primary transition-colors truncate">
                     {t.name}
                   </span>
-                  {phaseBadge(t.phase)}
+                  <StatusBadge visual={tenantPhase(t.phase)} />
                 </div>
                 <span className="text-[11px] text-muted-foreground/70 shrink-0">
                   {formatRelativeTime(t.last_observed_at)}

@@ -5,12 +5,12 @@ import { api } from "@/api/client";
 import { useAuth } from "@/hooks/useAuth";
 import { navigate } from "@/hooks/useNavigate";
 import type { Team, TenantOperation, TenantTeamAccess } from "@/api/types";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Link } from "@/components/ui/link";
 import { formatRelativeTime } from "@/lib/utils";
-import { phaseBadge } from "./TenantList";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { tenantPhase, tenantOpStatus } from "@/lib/status";
 import {
   ArrowLeft,
   Boxes,
@@ -81,7 +81,7 @@ export function TenantDetail({ tenantId }: { tenantId: string }) {
 
   if (isLoading) {
     return (
-      <div className="flex justify-center py-20">
+      <div className="flex-1 flex items-center justify-center">
         <Spinner className="w-6 h-6 text-primary" />
       </div>
     );
@@ -89,7 +89,7 @@ export function TenantDetail({ tenantId }: { tenantId: string }) {
 
   if (isError || !data) {
     return (
-      <div className="p-6">
+      <div className="flex-1 flex flex-col items-center justify-center">
         <div className="bg-destructive/8 text-destructive border border-destructive/15 rounded-lg p-4 text-sm">
           Failed to load tenant.
         </div>
@@ -98,7 +98,7 @@ export function TenantDetail({ tenantId }: { tenantId: string }) {
   }
 
   return (
-    <div className="p-6 w-full max-w-3xl mx-auto flex-1 flex flex-col justify-center animate-fade-up">
+    <div className="p-6 w-full max-w-3xl mx-auto flex-1 flex flex-col animate-fade-up">
       <Link
         href="/tenants"
         className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-1 mb-3 transition-colors"
@@ -117,7 +117,7 @@ export function TenantDetail({ tenantId }: { tenantId: string }) {
               <h1 className="text-lg font-semibold tracking-tight">
                 {data.name}
               </h1>
-              {phaseBadge(data.phase)}
+              <StatusBadge visual={tenantPhase(data.phase)} />
             </div>
             <p className="text-[12px] text-muted-foreground mt-0.5">
               <Link
@@ -306,17 +306,7 @@ function OperationsPanel({ ops }: { ops: TenantOperation[] }) {
       <div className="divide-y divide-border/30">
         {ops.map((op) => (
           <div key={op.id} className="px-4 py-2.5 text-xs flex items-center gap-3">
-            <Badge
-              variant={
-                op.status === "committed"
-                  ? "success"
-                  : op.status === "failed"
-                  ? "destructive"
-                  : "default"
-              }
-            >
-              {op.status}
-            </Badge>
+            <StatusBadge visual={tenantOpStatus(op.status)} />
             <span className="font-mono text-[11px] uppercase tracking-wide text-muted-foreground">
               {op.operation}
             </span>

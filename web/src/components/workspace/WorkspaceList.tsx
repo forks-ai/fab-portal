@@ -6,7 +6,7 @@ import type { Workspace, CreateWorkspaceRequest } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { Spinner } from "@/components/ui/spinner";
+import { SkeletonCards } from "@/components/ui/skeleton";
 import { RunStatusBadge } from "@/components/run/RunStatusBadge";
 import { Pagination } from "@/components/ui/pagination";
 import { CreateWorkspaceDialog } from "./CreateWorkspaceDialog";
@@ -84,7 +84,7 @@ export function WorkspaceList() {
   ];
 
   return (
-    <div className="p-6">
+    <div className="p-6 flex flex-col flex-1">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-lg font-semibold tracking-tight">Workspaces</h1>
@@ -124,14 +124,15 @@ export function WorkspaceList() {
       </div>
 
       {isLoading ? (
-        <div className="flex items-center justify-center py-20">
-          <Spinner className="w-6 h-6" />
-        </div>
+        <SkeletonCards />
       ) : isError ? (
-        <div className="rounded-lg border border-destructive/20 bg-destructive/5 p-10 text-center">
-          <p className="text-sm text-destructive">Failed to load workspaces. Please try again.</p>
+        <div className="flex-1 flex flex-col items-center justify-center">
+          <div className="rounded-lg border border-destructive/20 bg-destructive/5 p-10 text-center">
+            <p className="text-sm text-destructive">Failed to load workspaces. Please try again.</p>
+          </div>
         </div>
       ) : !data?.data?.length ? (
+        <div className="flex-1 flex flex-col items-center justify-center">
         <div className="rounded-lg border border-dashed border-border p-12 text-center">
           <FolderGit2 className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
           <h3 className="text-lg font-medium mb-2">
@@ -148,6 +149,7 @@ export function WorkspaceList() {
               Create workspace
             </Button>
           )}
+        </div>
         </div>
       ) : (
         <>
@@ -173,17 +175,17 @@ export function WorkspaceList() {
                         <RunStatusBadge status={workspace.last_run_status as RunStatus} />
                       )}
                       {workspace.auto_apply && (
-                        <Badge variant="outline" className="text-xs py-0 px-1.5 text-blue-400 border-blue-400/30">
+                        <Badge variant="outline" className="text-xs py-0 px-1.5 text-success border-success/30">
                           <Zap className="w-3 h-3 mr-0.5" />auto
                         </Badge>
                       )}
                       {workspace.requires_approval && (
-                        <Badge variant="outline" className="text-xs py-0 px-1.5 text-amber-400 border-amber-400/30">
+                        <Badge variant="outline" className="text-xs py-0 px-1.5 text-warning border-warning/30">
                           <ShieldCheck className="w-3 h-3 mr-0.5" />approval
                         </Badge>
                       )}
                       {workspace.vcs_trigger_enabled && (
-                        <Badge variant="outline" className="text-xs py-0 px-1.5 text-violet-400 border-violet-400/30">
+                        <Badge variant="outline" className="text-xs py-0 px-1.5 text-primary border-primary/30">
                           <Webhook className="w-3 h-3 mr-0.5" />vcs
                         </Badge>
                       )}

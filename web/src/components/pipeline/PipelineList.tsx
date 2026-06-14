@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Spinner } from "@/components/ui/spinner";
+import { SkeletonRows } from "@/components/ui/skeleton";
 import { Link } from "@/components/ui/link";
 import {
   Dialog,
@@ -49,26 +49,8 @@ export function PipelineList() {
     onError: () => toast.error("Failed to delete pipeline"),
   });
 
-  if (isLoading) {
-    return (
-      <div className="flex justify-center py-20">
-        <Spinner className="w-6 h-6 text-primary" />
-      </div>
-    );
-  }
-
-  if (isError) {
-    return (
-      <div className="p-6">
-        <div className="bg-destructive/8 text-destructive border border-destructive/15 rounded-lg p-4 text-sm">
-          Failed to load pipelines.
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className="p-6">
+    <div className="p-6 flex flex-col flex-1">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-lg font-semibold tracking-tight">Pipelines</h1>
@@ -82,8 +64,16 @@ export function PipelineList() {
         </Button>
       </div>
 
-      {pipelines && pipelines.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-20 text-center animate-fade-up">
+      {isLoading ? (
+        <SkeletonRows />
+      ) : isError ? (
+        <div className="flex-1 flex flex-col items-center justify-center">
+          <div className="bg-destructive/8 text-destructive border border-destructive/15 rounded-lg p-4 text-sm">
+            Failed to load pipelines.
+          </div>
+        </div>
+      ) : pipelines && pipelines.length === 0 ? (
+        <div className="flex-1 flex flex-col items-center justify-center text-center animate-fade-up">
           <div className="w-12 h-12 rounded-lg bg-primary/8 flex items-center justify-center mb-4">
             <GitBranch className="w-5 h-5 text-primary/60" />
           </div>
