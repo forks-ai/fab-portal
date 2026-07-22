@@ -66,25 +66,55 @@ func (s *RunService) List(ctx context.Context, workspaceID, orgID string, page, 
 	return runs, count, nil
 }
 
-func (s *RunService) Get(ctx context.Context, id, orgID string) (repository.Run, error) {
-	return s.queries.GetRun(ctx, repository.GetRunParams{
-		ID:    id,
-		OrgID: orgID,
+// Get returns one run of one workspace. Callers come in through
+// /workspaces/{workspaceID}/runs/{runID}, which is authorized against the
+// workspace in the path, so the run is keyed on that workspace as well as the
+// org: a run id belonging to a different workspace is not found.
+func (s *RunService) Get(ctx context.Context, id, workspaceID, orgID string) (repository.Run, error) {
+	return s.queries.GetRunInWorkspace(ctx, repository.GetRunInWorkspaceParams{
+		ID:          id,
+		WorkspaceID: workspaceID,
+		OrgID:       orgID,
 	})
 }
 
+// Create records a run and freezes the configuration it will execute.
+//
+// The config is resolved from the workspace here, once, and stored on the run
+// row; the worker executes what the row says and never re-reads the workspace.
+// A run is not a pointer at "whatever the workspace says when the job starts" —
+// it is one execution of one tree. That is what makes an approval mean
+// something: a run parks at awaiting_approval, an admin reads the plan and
+// signs, and the apply that follows is the same repo, branch, directory and
+// uploaded config version the plan was produced from. Repointing the workspace
+// (PUT /workspaces/{id}, operator) or uploading a new archive
+// (POST /workspaces/{id}/upload, operator) in that window moves the NEXT run,
+// not the one already signed.
 func (s *RunService) Create(ctx context.Context, params CreateRunParams) (repository.Run, error) {
 	runID := ulid.Make().String()
 
+	ws, err := s.queries.GetWorkspace(ctx, repository.GetWorkspaceParams{
+		ID: params.WorkspaceID, OrgID: params.OrgID,
+	})
+	if err != nil {
+		return repository.Run{}, err
+	}
+
 	// Create run in database
 	run, err := s.queries.CreateRun(ctx, repository.CreateRunParams{
-		ID:          runID,
-		WorkspaceID: params.WorkspaceID,
-		OrgID:       params.OrgID,
-		Operation:   params.Operation,
-		Status:      "pending",
-		CreatedBy:   params.CreatedBy,
-		CommitSHA:   params.CommitSHA,
+		ID:                runID,
+		WorkspaceID:       params.WorkspaceID,
+		OrgID:             params.OrgID,
+		Operation:         params.Operation,
+		Status:            "pending",
+		CreatedBy:         params.CreatedBy,
+		CommitSHA:         params.CommitSHA,
+		ConfigSource:      ws.Source,
+		ConfigRepoURL:     ws.RepoURL,
+		ConfigRepoBranch:  ws.RepoBranch,
+		ConfigWorkingDir:  ws.WorkingDir,
+		ConfigVersionID:   ws.CurrentConfigVersionID,
+		ConfigTofuVersion: ws.TofuVersion,
 	})
 	if err != nil {
 		return repository.Run{}, err
@@ -131,8 +161,11 @@ func (s *RunService) Create(ctx context.Context, params CreateRunParams) (reposi
 	return run, nil
 }
 
-func (s *RunService) Cancel(ctx context.Context, runID, orgID string) (repository.Run, error) {
-	run, err := s.queries.CancelRun(ctx, runID, orgID)
+// Cancel stops a run of one workspace. Like Get, the workspace is part of the
+// key — cancelling is reachable through the workspace the caller was authorized
+// on, and no other.
+func (s *RunService) Cancel(ctx context.Context, runID, workspaceID, orgID string) (repository.Run, error) {
+	run, err := s.queries.CancelRun(ctx, runID, workspaceID, orgID)
 	if err != nil {
 		return repository.Run{}, err
 	}

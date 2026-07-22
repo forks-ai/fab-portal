@@ -4,11 +4,11 @@ package repository
 
 import "context"
 
-const runColumns = `id, workspace_id, org_id, operation, status, plan_output, plan_log_url, apply_log_url, resources_added, resources_changed, resources_deleted, error_message, commit_sha, plan_json_url, created_by, started_at, finished_at, created_at, updated_at`
+const runColumns = `id, workspace_id, org_id, operation, status, plan_output, plan_log_url, apply_log_url, resources_added, resources_changed, resources_deleted, error_message, commit_sha, config_source, config_repo_url, config_repo_branch, config_working_dir, config_version_id, config_tofu_version, plan_json_url, created_by, started_at, finished_at, created_at, updated_at`
 
 func scanRun(row interface{ Scan(...interface{}) error }) (Run, error) {
 	var r Run
-	err := row.Scan(&r.ID, &r.WorkspaceID, &r.OrgID, &r.Operation, &r.Status, &r.PlanOutput, &r.PlanLogURL, &r.ApplyLogURL, &r.ResourcesAdded, &r.ResourcesChanged, &r.ResourcesDeleted, &r.ErrorMessage, &r.CommitSHA, &r.PlanJSONURL, &r.CreatedBy, &r.StartedAt, &r.FinishedAt, &r.CreatedAt, &r.UpdatedAt)
+	err := row.Scan(&r.ID, &r.WorkspaceID, &r.OrgID, &r.Operation, &r.Status, &r.PlanOutput, &r.PlanLogURL, &r.ApplyLogURL, &r.ResourcesAdded, &r.ResourcesChanged, &r.ResourcesDeleted, &r.ErrorMessage, &r.CommitSHA, &r.ConfigSource, &r.ConfigRepoURL, &r.ConfigRepoBranch, &r.ConfigWorkingDir, &r.ConfigVersionID, &r.ConfigTofuVersion, &r.PlanJSONURL, &r.CreatedBy, &r.StartedAt, &r.FinishedAt, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
 }
 
@@ -25,11 +25,33 @@ func (q *Queries) GetRun(ctx context.Context, arg GetRunParams) (Run, error) {
 	return scanRun(row)
 }
 
-// GetRunForUpdate acquires a row-level lock on the run for use within a transaction.
-func (q *Queries) GetRunForUpdate(ctx context.Context, arg GetRunParams) (Run, error) {
+// GetRunInWorkspaceParams keys a run by the workspace it belongs to as well as
+// its org.
+type GetRunInWorkspaceParams struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	OrgID       string `json:"org_id"`
+}
+
+// GetRunInWorkspace is the lookup for HTTP routes under
+// /workspaces/{workspaceID}/runs/{runID}: those are authorized against the
+// workspace in the path, so the run has to belong to it. GetRun (org-scoped)
+// stays for the worker and the pipeline advance path, which hold a run id
+// straight off the job args and have no workspace in hand to check against.
+func (q *Queries) GetRunInWorkspace(ctx context.Context, arg GetRunInWorkspaceParams) (Run, error) {
 	row := q.db.QueryRow(ctx,
-		`SELECT `+runColumns+` FROM runs WHERE id = $1 AND org_id = $2 FOR UPDATE`,
-		arg.ID, arg.OrgID,
+		`SELECT `+runColumns+` FROM runs WHERE id = $1 AND workspace_id = $2 AND org_id = $3`,
+		arg.ID, arg.WorkspaceID, arg.OrgID,
+	)
+	return scanRun(row)
+}
+
+// GetRunInWorkspaceForUpdate is GetRunInWorkspace with the row lock the
+// approval transaction takes.
+func (q *Queries) GetRunInWorkspaceForUpdate(ctx context.Context, arg GetRunInWorkspaceParams) (Run, error) {
+	row := q.db.QueryRow(ctx,
+		`SELECT `+runColumns+` FROM runs WHERE id = $1 AND workspace_id = $2 AND org_id = $3 FOR UPDATE`,
+		arg.ID, arg.WorkspaceID, arg.OrgID,
 	)
 	return scanRun(row)
 }
@@ -80,22 +102,33 @@ func (q *Queries) CountRunsByWorkspace(ctx context.Context, arg CountRunsByWorks
 	return count, err
 }
 
+// CreateRunParams carries the run's identity and the configuration it will
+// execute. The config fields are resolved from the workspace by the service
+// layer and frozen on the row — see RunService.Create.
 type CreateRunParams struct {
-	ID          string `json:"id"`
-	WorkspaceID string `json:"workspace_id"`
-	OrgID       string `json:"org_id"`
-	Operation   string `json:"operation"`
-	Status      string `json:"status"`
-	CreatedBy   string `json:"created_by"`
-	CommitSHA   string `json:"commit_sha"`
+	ID                string `json:"id"`
+	WorkspaceID       string `json:"workspace_id"`
+	OrgID             string `json:"org_id"`
+	Operation         string `json:"operation"`
+	Status            string `json:"status"`
+	CreatedBy         string `json:"created_by"`
+	CommitSHA         string `json:"commit_sha"`
+	ConfigSource      string `json:"config_source"`
+	ConfigRepoURL     string `json:"config_repo_url"`
+	ConfigRepoBranch  string `json:"config_repo_branch"`
+	ConfigWorkingDir  string `json:"config_working_dir"`
+	ConfigVersionID   string `json:"config_version_id"`
+	ConfigTofuVersion string `json:"config_tofu_version"`
 }
 
 func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx,
-		`INSERT INTO runs (id, workspace_id, org_id, operation, status, created_by, commit_sha)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`INSERT INTO runs (id, workspace_id, org_id, operation, status, created_by, commit_sha,
+			config_source, config_repo_url, config_repo_branch, config_working_dir, config_version_id, config_tofu_version)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING `+runColumns,
 		arg.ID, arg.WorkspaceID, arg.OrgID, arg.Operation, arg.Status, arg.CreatedBy, arg.CommitSHA,
+		arg.ConfigSource, arg.ConfigRepoURL, arg.ConfigRepoBranch, arg.ConfigWorkingDir, arg.ConfigVersionID, arg.ConfigTofuVersion,
 	)
 	return scanRun(row)
 }
@@ -132,15 +165,51 @@ func (q *Queries) UpdateRunStatus(ctx context.Context, arg UpdateRunStatusParams
 	return scanRun(row)
 }
 
-// CancelRun atomically sets status to 'cancelled' only if the run is in a cancellable state.
-// Returns pgx.ErrNoRows if the run was already in a terminal status.
-func (q *Queries) CancelRun(ctx context.Context, id, orgID string) (Run, error) {
+// PinRunCommitSHA records the commit a run executed, once. The guard on the
+// column is the whole contract: a run's commit is set either by the VCS trigger
+// that created it or by the first execution that resolved a checkout, and after
+// that it is the tree that run means. A second execution of the same row — the
+// apply that follows an approval, or an auto-apply — reads it rather than
+// rewriting it, which is what stops the apply from landing on a branch that
+// moved while the plan sat waiting for a signature.
+func (q *Queries) PinRunCommitSHA(ctx context.Context, id, commitSHA string) error {
+	_, err := q.db.Exec(ctx,
+		`UPDATE runs SET commit_sha = $2, updated_at = NOW() WHERE id = $1 AND commit_sha = ''`,
+		id, commitSHA,
+	)
+	return err
+}
+
+// MarkRunApproved transitions a signed-off run to the apply it was approved
+// for: the operation becomes 'apply' and the status becomes whatever the
+// approval transaction could take — 'queued' when it also took the workspace's
+// run slot, 'pending' when another run holds it.
+//
+// The operation has to move with the status. Every path that enqueues a run
+// reads the operation off the row (ClaimAndEnqueueNextRun), so a run left as
+// 'plan' would be re-planned instead of applied when the slot frees up, and the
+// approval would silently do nothing.
+func (q *Queries) MarkRunApproved(ctx context.Context, id, status string) (Run, error) {
+	row := q.db.QueryRow(ctx,
+		`UPDATE runs SET operation = 'apply', status = $2, updated_at = NOW() WHERE id = $1 RETURNING `+runColumns,
+		id, status,
+	)
+	return scanRun(row)
+}
+
+// CancelRun atomically sets status to 'cancelled' only if the run is in a
+// cancellable state and belongs to the named workspace. Returns pgx.ErrNoRows
+// if the run was already in a terminal status, does not exist, or lives on a
+// different workspace — the caller cannot tell those apart, which is the point:
+// cancelling is reachable through the workspace that was authorized, and no
+// other.
+func (q *Queries) CancelRun(ctx context.Context, id, workspaceID, orgID string) (Run, error) {
 	row := q.db.QueryRow(ctx,
 		`UPDATE runs SET status = 'cancelled', updated_at = NOW()
-		WHERE id = $1 AND org_id = $2
+		WHERE id = $1 AND workspace_id = $2 AND org_id = $3
 		AND status IN ('pending', 'queued', 'planning', 'planned', 'applying', 'awaiting_approval')
 		RETURNING `+runColumns,
-		id, orgID,
+		id, workspaceID, orgID,
 	)
 	return scanRun(row)
 }

@@ -18,6 +18,7 @@ const (
 	ActionDestroyRun      Action = "destroy_run"
 	ActionManageState     Action = "manage_state"
 	ActionManageVars      Action = "manage_vars"
+	ActionRevealSecret    Action = "reveal_secret"
 	ActionManageTeams     Action = "manage_teams"
 	ActionManageOrg       Action = "manage_org"
 	ActionDeleteWorkspace Action = "delete_workspace"
@@ -54,6 +55,11 @@ func minRoleForAction(action Action) string {
 		return "admin"
 	case ActionManageVars:
 		return "admin"
+	// Handing back the plaintext of a stored secret discloses at least as much
+	// as editing it, so the reveal endpoints sit at the same bar as the writes
+	// rather than a tier below them.
+	case ActionRevealSecret:
+		return "admin"
 	case ActionManageTeams:
 		return "admin"
 	case ActionManageOrg:
@@ -79,16 +85,23 @@ func MaxRole(a, b string) string {
 	return a
 }
 
-// ActionForOperation maps a run operation to the action it requires. apply and
-// destroy are the destructive operations and carry their own (higher) min-role;
-// plan/test/import are gated at the create_run baseline.
+// ActionForOperation maps a run operation to the action it requires.
+//
+// apply and destroy run tofu against live state and carry their own (higher)
+// min-role. import rewrites state — it decides which real resources a config
+// claims, and every other way to move state (downloading a tfstate, deleting a
+// serial) already sits at ActionManageState, so it does too. plan and test stay
+// at the create_run baseline; a workspace that gates applies raises test
+// separately, in requiresApprovalGate.
 func ActionForOperation(operation string) Action {
 	switch operation {
 	case "apply":
 		return ActionApplyRun
 	case "destroy":
 		return ActionDestroyRun
-	default: // plan, test, import
+	case "import":
+		return ActionManageState
+	default: // plan, test
 		return ActionCreateRun
 	}
 }

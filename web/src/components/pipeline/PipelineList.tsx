@@ -18,11 +18,18 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { GitBranch, Plus, Trash2, GripVertical } from 'lucide-react';
+import { roleAtLeast } from '@/lib/roles';
+import { useAuth } from '@/hooks/useAuth';
 
 export function PipelineList() {
   const [showCreate, setShowCreate] = useState(false);
   const queryClient = useQueryClient();
   const confirm = useConfirm();
+  const { user } = useAuth();
+  // POST /pipelines is operator+. Pipelines is a plain nav entry, so a viewer
+  // lands here — offering them a button the API is certain to refuse is a dead
+  // control, not a discovery affordance.
+  const canCreate = roleAtLeast(user?.role, 'operator');
 
   const {
     data: pipelines,
@@ -60,10 +67,12 @@ export function PipelineList() {
             Orchestrate sequential workspace deployments
           </p>
         </div>
-        <Button size="sm" onClick={() => setShowCreate(true)}>
-          <Plus className="w-3.5 h-3.5" />
-          New Pipeline
-        </Button>
+        {canCreate && (
+          <Button size="sm" onClick={() => setShowCreate(true)}>
+            <Plus className="w-3.5 h-3.5" />
+            New Pipeline
+          </Button>
+        )}
       </div>
 
       {isLoading ? (
@@ -81,12 +90,16 @@ export function PipelineList() {
           </div>
           <h2 className="text-sm font-semibold mb-1">No pipelines yet</h2>
           <p className="text-xs text-muted-foreground mb-5 max-w-[260px]">
-            Create a pipeline to orchestrate workspace deployments in sequence.
+            {canCreate
+              ? 'Create a pipeline to orchestrate workspace deployments in sequence.'
+              : 'Nothing here yet. Creating a pipeline takes an operator role or higher.'}
           </p>
-          <Button size="sm" onClick={() => setShowCreate(true)}>
-            <Plus className="w-3.5 h-3.5" />
-            Create Pipeline
-          </Button>
+          {canCreate && (
+            <Button size="sm" onClick={() => setShowCreate(true)}>
+              <Plus className="w-3.5 h-3.5" />
+              Create Pipeline
+            </Button>
+          )}
         </div>
       ) : (
         <div className="space-y-2">
@@ -149,6 +162,7 @@ export function PipelineList() {
 
 function CreatePipelineDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const uid = useId();
+  const { user } = useAuth();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [stages, setStages] = useState<CreatePipelineStageInput[]>([]);
@@ -182,11 +196,24 @@ function CreatePipelineDialog({ open, onClose }: { open: boolean; onClose: () =>
       setStages([]);
       onClose();
     },
-    onError: () => toast.error('Failed to create pipeline'),
+    onError: (e) =>
+      toast.error((e as { message?: string })?.message ?? 'Failed to create pipeline'),
   });
 
+  // A stage's auto_apply overrides the workspace's own setting for that run, so
+  // the API charges what that workspace's applies cost: on an ungated workspace
+  // it is the apply an operator may already start by hand, and on one that
+  // requires approval it is the admin bar. A stage on a gated workspace parks
+  // for a signature either way, so leaving auto off there costs nothing.
+  const isAdmin = roleAtLeast(user?.role, 'admin');
+  const canAutoApply = (workspaceId: string) =>
+    isAdmin || !workspaces?.find((w: Workspace) => w.id === workspaceId)?.requires_approval;
+
   const addStage = (workspaceId: string) => {
-    setStages([...stages, { workspace_id: workspaceId, auto_apply: true, on_failure: 'stop' }]);
+    setStages([
+      ...stages,
+      { workspace_id: workspaceId, auto_apply: canAutoApply(workspaceId), on_failure: 'stop' },
+    ]);
   };
 
   const removeStage = (index: number) => {
@@ -229,6 +256,7 @@ function CreatePipelineDialog({ open, onClose }: { open: boolean; onClose: () =>
   };
 
   const toggleAutoApply = (index: number) => {
+    if (!canAutoApply(stages[index].workspace_id)) return;
     const newStages = [...stages];
     newStages[index] = {
       ...newStages[index],
@@ -296,6 +324,12 @@ function CreatePipelineDialog({ open, onClose }: { open: boolean; onClose: () =>
 
           <div>
             <span className="text-xs font-medium text-muted-foreground mb-2 block">Stages</span>
+            {!isAdmin && stages.some((s) => !canAutoApply(s.workspace_id)) && (
+              <p className="text-xs text-muted-foreground mb-2">
+                A stage on a workspace that requires approval runs manual — it pauses for an admin
+                to sign before it applies.
+              </p>
+            )}
 
             {stages.length > 0 && (
               <div className="space-y-1 mb-3">
@@ -327,7 +361,15 @@ function CreatePipelineDialog({ open, onClose }: { open: boolean; onClose: () =>
                     <button
                       type="button"
                       onClick={() => toggleAutoApply(i)}
-                      className="cursor-pointer"
+                      disabled={!canAutoApply(stage.workspace_id)}
+                      title={
+                        canAutoApply(stage.workspace_id)
+                          ? 'Toggle whether this stage applies automatically'
+                          : 'This workspace requires approval — the stage waits for an admin to sign, and setting auto-apply on it is an admin action'
+                      }
+                      className={
+                        canAutoApply(stage.workspace_id) ? 'cursor-pointer' : 'cursor-not-allowed'
+                      }
                     >
                       <Badge variant={stage.auto_apply ? 'success' : 'secondary'}>
                         {stage.auto_apply ? 'auto' : 'manual'}

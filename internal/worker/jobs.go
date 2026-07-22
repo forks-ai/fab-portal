@@ -96,8 +96,22 @@ func (w *RunJobWorker) Work(ctx context.Context, job *river.Job[RunJobArgs]) err
 	if args.Operation == "apply" || args.Operation == "destroy" || args.Operation == "import" || args.Operation == "test" {
 		status = "applying"
 	}
-	if _, err := w.queries.UpdateRunStarted(ctx, repository.UpdateRunStartedParams{ID: args.RunID, Status: status}); err != nil {
+	run, err := w.queries.UpdateRunStarted(ctx, repository.UpdateRunStartedParams{ID: args.RunID, Status: status})
+	if err != nil {
 		return fmt.Errorf("failed to update run started: %w", err)
+	}
+
+	// The configuration to execute comes off the run row, where RunService.Create
+	// froze it, not off the workspace. The workspace is still read for the
+	// approval-gate decision after a plan, which is a question about the
+	// workspace as it stands now, not about the tree this run holds.
+	//
+	// An unpinned row can only be one written outside the run service (seeded
+	// demo history), and there is no safe guess for what it meant to run — the
+	// only fallback available is the live workspace, which is exactly what the
+	// pin exists to stop the worker reading. So it fails.
+	if run.ConfigSource == "" {
+		return w.failRun(ctx, args, logger, errors.New("run has no pinned configuration"), "")
 	}
 
 	// Get workspace
@@ -189,14 +203,14 @@ func (w *RunJobWorker) Work(ctx context.Context, job *river.Job[RunJobArgs]) err
 
 	// Download config archive for upload workspaces
 	var archiveData []byte
-	if workspace.Source == "upload" && workspace.CurrentConfigVersionID != "" && w.storage != nil {
-		key := fmt.Sprintf("configs/%s/%s.tar.gz", args.WorkspaceID, workspace.CurrentConfigVersionID)
+	if run.ConfigSource == "upload" && run.ConfigVersionID != "" && w.storage != nil {
+		key := fmt.Sprintf("configs/%s/%s.tar.gz", args.WorkspaceID, run.ConfigVersionID)
 		data, err := w.storage.GetConfigArchive(ctx, key)
 		if err != nil {
 			return w.failRun(ctx, args, logger, fmt.Errorf("failed to download config archive: %w", err), "")
 		}
 		archiveData = data
-		logger.Info("downloaded config archive", "config_version", workspace.CurrentConfigVersionID, "size", len(data))
+		logger.Info("downloaded config archive", "config_version", run.ConfigVersionID, "size", len(data))
 	}
 
 	// Derive state encryption passphrase if encryption is configured
@@ -212,21 +226,41 @@ func (w *RunJobWorker) Work(ctx context.Context, job *river.Job[RunJobArgs]) err
 		w.streamer.Publish(args.RunID, line)
 	}
 
+	// The commit to execute. For a VCS run the branch on the run row is only
+	// half a pin: a branch moves, and the window between a plan parking at
+	// awaiting_approval and the apply that follows the signature is exactly when
+	// it moves. run.commit_sha is what closes that — set by the VCS trigger for
+	// a webhook run, and otherwise filled in below from the commit the first
+	// execution of this run resolved. Either way the apply re-runs the same run
+	// row, so it reads the same pin the plan was produced under.
+	//
+	// A value that is not an object id fails the run. There is no safe reading
+	// of it: ignoring it applies branch head, which is the tree nobody planned.
+	pinnedCommit := ""
+	if run.ConfigSource == "vcs" && run.CommitSHA != "" {
+		if !executor.IsCommitSHA(run.CommitSHA) {
+			return w.failRun(ctx, args, logger,
+				fmt.Errorf("run is pinned to %q, which is not a git commit id", run.CommitSHA), "")
+		}
+		pinnedCommit = run.CommitSHA
+	}
+
 	// Execute
 	execStart := time.Now()
 	result, err := w.executor.Execute(ctx, executor.ExecuteParams{
 		RunID:                     args.RunID,
 		WorkspaceID:               args.WorkspaceID,
 		Operation:                 args.Operation,
-		RepoURL:                   workspace.RepoURL,
-		RepoBranch:                workspace.RepoBranch,
-		WorkingDir:                workspace.WorkingDir,
-		TofuVersion:               workspace.TofuVersion,
+		RepoURL:                   run.ConfigRepoURL,
+		RepoBranch:                run.ConfigRepoBranch,
+		CommitSHA:                 pinnedCommit,
+		WorkingDir:                run.ConfigWorkingDir,
+		TofuVersion:               run.ConfigTofuVersion,
 		Variables:                 execVars,
 		LogCallback:               logCallback,
 		PreviousState:             previousState,
 		StateEncryptionPassphrase: stateEncPassphrase,
-		Source:                    workspace.Source,
+		Source:                    run.ConfigSource,
 		ArchiveData:               archiveData,
 		ImportResources:           toExecutorImports(args.Imports),
 	})
@@ -281,6 +315,26 @@ func (w *RunJobWorker) Work(ctx context.Context, job *river.Job[RunJobArgs]) err
 			autoApply = *args.AutoApplyOverride
 		}
 		finalStatus = postPlanAction(autoApply, workspace.RequiresApproval)
+	}
+
+	// Pin the run to the commit it just executed, if it wasn't already pinned.
+	// This is what makes an approval mean a tree: the admin reads a plan of this
+	// commit, and the apply that follows re-runs this same run row, so it reads
+	// this same commit back out even if the branch has moved. PinRunCommitSHA
+	// only writes an empty column, so a webhook-supplied pin is never rewritten
+	// by what the checkout resolved.
+	//
+	// If the write fails and an apply is going to follow off this row — a plan
+	// parked for approval, or one queued for auto-apply — the run fails instead:
+	// an unpinned approvable run is the moving target this exists to remove.
+	if pinnedCommit == "" && result.CommitSHA != "" {
+		if err := w.queries.PinRunCommitSHA(ctx, args.RunID, result.CommitSHA); err != nil {
+			if finalStatus == "awaiting_approval" || finalStatus == "queued" {
+				return w.failRun(ctx, args, logger,
+					fmt.Errorf("failed to pin run to commit %s: %w", result.CommitSHA, err), logBuf.String())
+			}
+			logger.Error("failed to record executed commit", "commit", result.CommitSHA, "error", err)
+		}
 	}
 
 	// Upload logs to S3
@@ -465,7 +519,7 @@ func (w *RunJobWorker) isRunCancelled(ctx context.Context, runID, orgID string) 
 }
 
 // postPlanAction determines the status after a plan completes.
-// auto_apply wins over requires_approval. "queued" triggers auto-apply enqueue.
+// requires_approval wins over auto_apply. "queued" triggers auto-apply enqueue.
 // selectBrowseState returns the bytes that should be uploaded as the
 // resource-browser / pipeline-output state for the run, or nil when there
 // is nothing to capture. In plain-tofu mode the executor produces both
@@ -483,11 +537,18 @@ func selectBrowseState(stateFile, stateJSON []byte) []byte {
 }
 
 func postPlanAction(autoApply, requiresApproval bool) string {
-	if autoApply {
-		return "queued"
-	}
+	// requires_approval is checked first, and wins. It is the workspace's
+	// statement that no apply happens without a human signing off, so it has to
+	// outrank auto_apply — otherwise auto_apply is a way to skip the approval
+	// rather than a convenience on workspaces that do not need one. A pipeline
+	// stage supplies auto_apply as a per-run override (AutoApplyOverride), so
+	// with the old ordering a stage could turn the gate off for a workspace
+	// whose owner had turned it on.
 	if requiresApproval {
 		return "awaiting_approval"
+	}
+	if autoApply {
+		return "queued"
 	}
 	return "planned"
 }

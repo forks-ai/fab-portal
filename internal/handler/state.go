@@ -11,6 +11,7 @@ import (
 	"github.com/nanohype/portal/internal/handler/respond"
 	"github.com/nanohype/portal/internal/repository"
 	"github.com/nanohype/portal/internal/service"
+	"github.com/nanohype/portal/internal/tfstate"
 )
 
 type StateHandler struct {
@@ -88,9 +89,10 @@ func (h *StateHandler) GetCurrent(w http.ResponseWriter, r *http.Request) {
 
 func (h *StateHandler) Get(w http.ResponseWriter, r *http.Request) {
 	userCtx := auth.GetUser(r.Context())
+	workspaceID := chi.URLParam(r, "workspaceID")
 	stateID := chi.URLParam(r, "stateID")
 
-	sv, err := h.svc.Version(r.Context(), stateID, userCtx.OrgID)
+	sv, err := h.svc.Version(r.Context(), stateID, workspaceID, userCtx.OrgID)
 	if err != nil {
 		respond.FromError(w, r, err)
 		return
@@ -100,9 +102,13 @@ func (h *StateHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 func (h *StateHandler) Download(w http.ResponseWriter, r *http.Request) {
 	userCtx := auth.GetUser(r.Context())
+	workspaceID := chi.URLParam(r, "workspaceID")
 	stateID := chi.URLParam(r, "stateID")
 
-	_, data, err := h.svc.Download(r.Context(), stateID, userCtx.OrgID)
+	// The blob is the workspace's whole tfstate. It is fetched by the workspace
+	// this request was authorized against, so a state-version id from another
+	// workspace is a 404.
+	_, data, err := h.svc.Download(r.Context(), stateID, workspaceID, userCtx.OrgID)
 	if err != nil {
 		respond.FromError(w, r, err)
 		return
@@ -114,11 +120,31 @@ func (h *StateHandler) Download(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+// attributeView decides how much of a state file this request may read back.
+//
+// The route sits at the workspace read bar, because the resource inventory —
+// what this config manages, under which provider, and which attributes changed
+// between two serials — is what the State tab is for and everyone who can see
+// the workspace may see it. The attribute VALUES are the tfstate blob itself,
+// cleartext provider credentials included, and the download that hands over
+// the same bytes sits at ActionManageState. So the values follow the download,
+// not the route.
+//
+// It reads the effective workspace role the gate resolved, so a team grant on
+// this one workspace buys the same view an org admin has on it — and an empty
+// role (no gate ran, or the gate found none) redacts.
+func attributeView(r *http.Request) tfstate.AttributeView {
+	if auth.CanPerform(auth.WorkspaceRole(r.Context()), auth.ActionManageState) {
+		return tfstate.AttributesFull
+	}
+	return tfstate.AttributesRedacted
+}
+
 func (h *StateHandler) Resources(w http.ResponseWriter, r *http.Request) {
 	userCtx := auth.GetUser(r.Context())
 	workspaceID := chi.URLParam(r, "workspaceID")
 
-	resources, err := h.svc.Resources(r.Context(), workspaceID, userCtx.OrgID)
+	resources, err := h.svc.Resources(r.Context(), workspaceID, userCtx.OrgID, attributeView(r))
 	if err != nil {
 		respond.FromError(w, r, err)
 		return
@@ -153,7 +179,7 @@ func (h *StateHandler) Diff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	diff, err := h.svc.Diff(r.Context(), workspaceID, userCtx.OrgID, fromSerial, toSerial)
+	diff, err := h.svc.Diff(r.Context(), workspaceID, userCtx.OrgID, fromSerial, toSerial, attributeView(r))
 	if err != nil {
 		respond.FromError(w, r, err)
 		return

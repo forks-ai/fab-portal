@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -52,7 +53,27 @@ func validateRepoBranch(branch string) error {
 
 // validateWorkingDir rejects working dirs that escape the checkout or carry
 // shell/option payloads. Empty is allowed — the service fills ".".
+//
+// A working directory is judged twice: as the request spelled it, and as
+// service.CanonicalWorkingDir folds it. The second one is the working_dir —
+// it is what the column holds, what the executors cd into, what the gated-twin
+// comparison reads, and what the settings form resubmits on the next save — and
+// path.Clean can turn an admissible spelling into an inadmissible one. "./-rf"
+// carries no leading dash until the "./" in front of it is folded away, and
+// then it is "-rf", which the rules below refuse and git would read as an
+// option. Judging only the typed form leaves rows holding values that break the
+// rule they were checked against, and a workspace whose settings can never be
+// saved again, because the resubmit is validated as the stored spelling.
 func validateWorkingDir(dir string) error {
+	if err := workingDirRules(dir); err != nil {
+		return err
+	}
+	return workingDirRules(service.CanonicalWorkingDir(dir))
+}
+
+// workingDirRules is the rule set every spelling of a working directory has to
+// clear, typed or canonical.
+func workingDirRules(dir string) error {
 	if dir == "" {
 		return nil
 	}
@@ -91,16 +112,27 @@ func validateRepoURL(url string) error {
 	return nil
 }
 
-// validateRepoFields runs the three repo-field validators and returns the first
-// error, so Create and Update share one call site.
-func validateRepoFields(repoURL, branch, workingDir string) error {
+// admitRepoFields runs the three repo-field validators and returns the first
+// error, so Create and Update share one call site. On success it hands back the
+// working directory the caller must carry forward — the canonical spelling,
+// which is the one the row will hold.
+//
+// Admitting and canonicalising are one call because they are one decision. A
+// route that validated here and canonicalised a few lines further down would
+// be judging one string and storing another, and only the stored one is read
+// again; splitting them across two routes is how the two orderings drift apart
+// and a fix lands on one of them.
+func admitRepoFields(repoURL, branch, workingDir string) (string, error) {
 	if err := validateRepoURL(repoURL); err != nil {
-		return err
+		return "", err
 	}
 	if err := validateRepoBranch(branch); err != nil {
-		return err
+		return "", err
 	}
-	return validateWorkingDir(workingDir)
+	if err := validateWorkingDir(workingDir); err != nil {
+		return "", err
+	}
+	return service.CanonicalWorkingDir(workingDir), nil
 }
 
 type WorkspaceHandler struct {
@@ -158,26 +190,212 @@ type WorkspaceSummaryResponse struct {
 // workspace update.
 //
 // auto_apply and requires_approval together decide whether an apply waits for a
-// human. Turning the wait off removes exactly the approval that ActionApplyProd
-// protects, so moving either one asks for the same org-level authority as
-// signing an approval — a per-workspace team grant does not carry it. Every
-// other field on the settings form stays at the route's operator bar.
+// human. Removing that wait removes exactly the approval that ActionApplyProd
+// protects, so it asks for the same org-level authority as signing one — a
+// per-workspace team grant does not carry it. Every other field on the settings
+// form stays at the route's operator bar.
 func approvalGateChangeAllowed(current repository.Workspace, req UpdateWorkspaceRequest, orgRole string) bool {
-	if !changesApprovalGate(current, req) {
+	if !opensApprovalGate(current, req) {
 		return true
 	}
 	return auth.CanPerform(orgRole, auth.ActionApplyProd)
 }
 
-// changesApprovalGate reports whether an update actually moves auto_apply or
-// requires_approval away from what the workspace stores today. The settings
-// form submits every field on every save, so a nil-pointer check would flag
-// each save; only a real change is an authorization event.
-func changesApprovalGate(current repository.Workspace, req UpdateWorkspaceRequest) bool {
-	if req.AutoApply != nil && *req.AutoApply != current.AutoApply {
+// approvalGateAtCreateAllowed decides whether a caller may stand up a workspace
+// with these approval-gate settings.
+//
+// A new workspace defaults to auto_apply off, so it starts behind the same
+// human-in-the-loop Update protects. Asking for auto_apply at creation asks for
+// a workspace that applies to live cloud state with nobody signing off — the
+// authority Update holds at ActionApplyProd. Without this, the guard on Update
+// is trivially sidestepped: create the workspace with the gate already open
+// instead of opening it afterwards.
+//
+// requires_approval only ever adds a wait, so turning it on needs no extra bar.
+func approvalGateAtCreateAllowed(autoApply bool, orgRole string) bool {
+	if !autoApply {
 		return true
 	}
-	if req.RequiresApproval != nil && *req.RequiresApproval != current.RequiresApproval {
+	return auth.CanPerform(orgRole, auth.ActionApplyProd)
+}
+
+// gatedTwinAllowed decides whether a caller may stand up — or repoint — an
+// ungated workspace onto a config some other workspace already gates.
+//
+// requires_approval lives on the workspace row, but what it protects is the
+// infrastructure the config manages, and a workspace row is not a boundary
+// around that. Two workspaces on the same repo + working_dir run the same
+// resource addresses against the same cloud accounts, so an ungated twin is a
+// second door onto the gated workspace's own resources, opened at the operator
+// bar the create and update routes sit at.
+//
+// Whether they also share state varies — a terragrunt tree declares remote_state
+// itself, and so does any .tf with a backend block, while portal keeps state per
+// workspace for a plain-tofu leaf. It does not change the answer: plenty of
+// creates are overwrites at the provider API (a bucket policy, an inline role
+// policy, a DNS record), so an apply from the twin lands on the gated
+// workspace's infrastructure either way, and org-scoped variables are inherited
+// by any new workspace, so the twin does not need variables of its own to
+// resolve to the same target.
+//
+// Two ways through: carry the gate too — an operator may always create the twin
+// gated, since requires_approval only ever adds a wait — or hold the authority
+// to release a gated apply in the first place, ActionApplyProd, the same bar
+// turning the gate off already takes.
+//
+// This keys on the config identity portal can see. Upload workspaces have no
+// repo URL to compare, so two uploads of the same tree stay indistinguishable
+// here; the check does not claim to cover them.
+func gatedTwinAllowed(hasGatedTwin, requiresApproval bool, orgRole string) bool {
+	if !hasGatedTwin || requiresApproval {
+		return true
+	}
+	return auth.CanPerform(orgRole, auth.ActionApplyProd)
+}
+
+const gatedTwinMessage = "another workspace already requires approval for this repository and working directory: " +
+	"set requires_approval on this one too, or hold admin role or higher"
+
+// vacatesGatedConfig reports whether an update walks a gated workspace off the
+// config it is currently gating.
+//
+// sameTarget is the identity comparison HasGatedTwin uses, not a string compare:
+// a save that respells its own repo URL or working directory has not moved
+// anywhere and must not be charged for a move.
+//
+// An upload workspace has no repo URL, so it has no config identity to guard —
+// the same reading gatedTwinAllowed takes, and the same one the query takes.
+func vacatesGatedConfig(current repository.Workspace, targetGated, sameTarget bool) bool {
+	if !current.RequiresApproval || current.RepoURL == "" {
+		return false
+	}
+	return !sameTarget || !targetGated
+}
+
+// gatedOriginAllowed decides whether a caller may take the last approval gate
+// off a config.
+//
+// gatedTwinAllowed holds one half of the invariant: while a gated workspace
+// sits on a repo + working_dir, nobody may stand an ungated twin up there at
+// the operator bar. This holds the other half. Both checks in Update asked only
+// about the DESTINATION, so the invariant could be walked out of instead of
+// broken into: repoint the gated workspace somewhere else — a settings-form
+// field at the operator bar, opening no gate, so approvalGateChangeAllowed has
+// nothing to say — and the config it leaves behind is now guarded by nothing.
+// Then create an ungated workspace on it and apply, no approval row, no admin.
+//
+// Removing the only gate from a config is the same act as clearing that gate
+// outright, so it costs the same authority: ActionApplyProd. originStillGated
+// is the way out that keeps the invariant true — another gated workspace stays
+// behind on that config, and an operator may always create one, because
+// requires_approval only ever adds a wait.
+func gatedOriginAllowed(vacates, originStillGated bool, orgRole string) bool {
+	if !vacates || originStillGated {
+		return true
+	}
+	return auth.CanPerform(orgRole, auth.ActionApplyProd)
+}
+
+const gatedOriginMessage = "this is the only workspace requiring approval for its current repository and working directory, " +
+	"so moving it off would leave that configuration ungated: leave another workspace requiring approval on it, " +
+	"or hold admin role or higher"
+
+const gatedOriginDeleteMessage = "this is the only workspace requiring approval for its repository and working directory, " +
+	"so deleting it would leave that configuration ungated: leave another workspace requiring approval on it, " +
+	"or hold admin role or higher"
+
+// cloneApprovalGate decides what gate a clone carries, and whether the caller
+// may ask for it. It returns the gate to write and whether the request is
+// allowed.
+//
+// A clone lands on the source's repo and working directory, so it is a twin by
+// construction, and gatedTwinMessage tells the caller how to clear the refusal:
+// carry the gate too. That instruction has to be followable on the route that
+// prints it, so the clone request may raise the gate — the same direction
+// opensApprovalGate treats as free, for the same reason, adding a wait hands out
+// no authority.
+//
+// The other direction is the act that takes the human out of an apply. Clearing
+// a gate the source holds sits at ActionApplyProd here, exactly where the update
+// route holds it, so cloning is not a cheaper spelling of an ungating the update
+// route would refuse. Omitting the field inherits, which is what a clone meant
+// before the field existed.
+func cloneApprovalGate(sourceGated bool, requested *bool, orgRole string) (gate bool, allowed bool) {
+	gate = sourceGated
+	if requested != nil {
+		gate = *requested
+	}
+	if sourceGated && !gate && !auth.CanPerform(orgRole, auth.ActionApplyProd) {
+		return sourceGated, false
+	}
+	return gate, true
+}
+
+// effectiveConfigTarget resolves what a workspace will point at, and whether it
+// will be gated, once an update lands. UpdateWorkspace COALESCEs empty strings
+// and nil pointers to the stored row, so a request that omits a field is a
+// request to keep it.
+func effectiveConfigTarget(current repository.Workspace, req UpdateWorkspaceRequest) (repoURL, workingDir string, requiresApproval bool) {
+	repoURL = current.RepoURL
+	if req.RepoURL != "" {
+		repoURL = req.RepoURL
+	}
+	workingDir = current.WorkingDir
+	if req.WorkingDir != "" {
+		workingDir = req.WorkingDir
+	}
+	requiresApproval = current.RequiresApproval
+	if req.RequiresApproval != nil {
+		requiresApproval = *req.RequiresApproval
+	}
+	return repoURL, workingDir, requiresApproval
+}
+
+// movesConfigTarget reports whether an update actually repoints a workspace, or
+// changes whether it is gated.
+//
+// The twin check answers "may this caller put an ungated workspace on a config
+// something else gates". That is a question about a MOVE. The settings form
+// resubmits every field on every save, so without this an operator renaming a
+// workspace that already sits on such a config — a pair that predates the
+// check, or one an admin set up deliberately — would be refused an edit that
+// opens no door, and the only way out would be an admin. Same rule
+// changesApprovalGate follows for the gate itself: only a real change is an
+// authorization event.
+//
+// Turning the workspace's own gate off counts as a move, so an update that
+// clears requires_approval is still checked (it also passes through
+// approvalGateChangeAllowed, which holds that at admin on its own).
+func movesConfigTarget(current repository.Workspace, repoURL, workingDir string, requiresApproval bool) bool {
+	return repoURL != current.RepoURL ||
+		workingDir != current.WorkingDir ||
+		requiresApproval != current.RequiresApproval
+}
+
+// opensApprovalGate reports whether an update takes the human out of an apply on
+// this workspace: turning auto_apply on, or turning requires_approval off.
+//
+// The direction is the whole point, and it is the same direction
+// approvalGateAtCreateAllowed reads at creation. Adding a wait — gating a
+// workspace that was not gated, or dropping auto-apply — hands out no authority
+// the caller did not already have; it only costs them the ability to apply
+// unattended, on a workspace the operator route already lets them repoint. So it
+// is theirs to do.
+//
+// Holding both directions at admin looked symmetric but made the twin check's
+// documented way out unreachable: gatedTwinMessage tells an operator to set
+// requires_approval on their workspace too, and the update route would then
+// refuse the very field it asked for. It also meant an operator could never
+// raise protection on a workspace they own.
+//
+// The settings form submits every field on every save, so a nil-pointer check
+// would flag each save; only a real change in that direction is an
+// authorization event.
+func opensApprovalGate(current repository.Workspace, req UpdateWorkspaceRequest) bool {
+	if req.AutoApply != nil && *req.AutoApply && !current.AutoApply {
+		return true
+	}
+	if req.RequiresApproval != nil && !*req.RequiresApproval && current.RequiresApproval {
 		return true
 	}
 	return false
@@ -235,6 +453,15 @@ type CloneWorkspaceRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Environment string `json:"environment"`
+
+	// RequiresApproval overrides the gate the clone would otherwise inherit
+	// from its source. It exists because the twin refusal names it: cloning an
+	// ungated workspace that sits on a config something else gates is refused
+	// with "set requires_approval on this one too", and without this field
+	// there is no way to do that on the clone route — the caller would have to
+	// create the workspace by hand and copy the variables across, which is
+	// itself an admin-only call. Nil means inherit.
+	RequiresApproval *bool `json:"requires_approval"`
 }
 
 type UpdateWorkspaceRequest struct {
@@ -338,10 +565,16 @@ func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// repo_url / repo_branch / working_dir flow into the executor's git clone
 	// and cd — validate them against a safe charset to block command/option
 	// injection at the boundary (any role can create a workspace).
-	if err := validateRepoFields(req.RepoURL, req.RepoBranch, req.WorkingDir); err != nil {
+	//
+	// One leaf, one spelling: the twin check below and the row it writes both
+	// have to be about the directory, not about how the request typed it, so
+	// the request carries the canonical form from here on.
+	canonicalWorkingDir, err := admitRepoFields(req.RepoURL, req.RepoBranch, req.WorkingDir)
+	if err != nil {
 		respond.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.WorkingDir = canonicalWorkingDir
 
 	// Upload workspaces cannot have VCS trigger
 	if source == "upload" && req.VcsTriggerEnabled {
@@ -351,6 +584,22 @@ func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	if req.Environment != "" && req.Environment != "development" && req.Environment != "staging" && req.Environment != "production" {
 		respond.Error(w, http.StatusBadRequest, "environment must be development, staging, or production")
+		return
+	}
+
+	if !approvalGateAtCreateAllowed(req.AutoApply, userCtx.Role) {
+		respond.Error(w, http.StatusForbidden, "creating a workspace with auto_apply requires admin role or higher")
+		return
+	}
+
+	hasGatedTwin, err := h.svc.HasGatedTwin(r.Context(), userCtx.OrgID, req.RepoURL, req.WorkingDir, "")
+	if err != nil {
+		slog.Error("failed to check for a gated workspace on this config", "error", err)
+		respond.ErrorWithRequest(w, r, http.StatusInternalServerError, "failed to create workspace")
+		return
+	}
+	if !gatedTwinAllowed(hasGatedTwin, req.RequiresApproval, userCtx.Role) {
+		respond.Error(w, http.StatusForbidden, gatedTwinMessage)
 		return
 	}
 
@@ -398,10 +647,17 @@ func (h *WorkspaceHandler) Update(w http.ResponseWriter, r *http.Request) {
 		respond.Error(w, http.StatusBadRequest, "name must be at most 128 characters")
 		return
 	}
-	if err := validateRepoFields(req.RepoURL, req.RepoBranch, req.WorkingDir); err != nil {
+	// The canonical form lands on the request before anything reads the field,
+	// so movesConfigTarget compares the stored leaf against the requested leaf
+	// and not one spelling against another — otherwise a resubmit of the same
+	// directory typed differently reads as a move, and a real move to the same
+	// directory typed differently reads as a new target.
+	canonicalWorkingDir, err := admitRepoFields(req.RepoURL, req.RepoBranch, req.WorkingDir)
+	if err != nil {
 		respond.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.WorkingDir = canonicalWorkingDir
 	if len(req.Description) > 4096 {
 		respond.Error(w, http.StatusBadRequest, "description must be at most 4096 characters")
 		return
@@ -420,6 +676,55 @@ func (h *WorkspaceHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if !approvalGateChangeAllowed(current, req, userCtx.Role) {
 		respond.Error(w, http.StatusForbidden, "changing auto_apply or requires_approval requires admin role or higher")
 		return
+	}
+
+	// Update COALESCEs empty strings to the stored value, so the twin check has
+	// to run against what the workspace will point at after the write, not
+	// against what the request happened to carry. An update that leaves the
+	// config target and the gate exactly where they already are is not a move,
+	// and the twin check has nothing to decide about it.
+	targetRepoURL, targetWorkingDir, targetGated := effectiveConfigTarget(current, req)
+	if movesConfigTarget(current, targetRepoURL, targetWorkingDir, targetGated) {
+		hasGatedTwin, err := h.svc.HasGatedTwin(r.Context(), userCtx.OrgID, targetRepoURL, targetWorkingDir, workspaceID)
+		if err != nil {
+			slog.Error("failed to check for a gated workspace on this config", "error", err)
+			respond.ErrorWithRequest(w, r, http.StatusInternalServerError, "failed to update workspace")
+			return
+		}
+		if !gatedTwinAllowed(hasGatedTwin, targetGated, userCtx.Role) {
+			respond.Error(w, http.StatusForbidden, gatedTwinMessage)
+			return
+		}
+
+		// The move has two ends. The check above asks what arriving at the
+		// destination does; this asks what leaving the origin does, because a
+		// gated workspace is what makes gatedTwinAllowed refuse an ungated twin
+		// on the config it sits on. Walking it away retires that refusal.
+		//
+		// Only a gated VCS workspace can be holding a config, so nothing else
+		// pays for the two lookups.
+		if current.RequiresApproval && current.RepoURL != "" {
+			sameTarget, err := h.svc.SameConfigTarget(r.Context(), current.RepoURL, current.WorkingDir, targetRepoURL, targetWorkingDir)
+			if err != nil {
+				slog.Error("failed to compare this workspace's current and requested config", "error", err)
+				respond.ErrorWithRequest(w, r, http.StatusInternalServerError, "failed to update workspace")
+				return
+			}
+			vacates := vacatesGatedConfig(current, targetGated, sameTarget)
+			originStillGated := false
+			if vacates {
+				originStillGated, err = h.svc.HasGatedTwin(r.Context(), userCtx.OrgID, current.RepoURL, current.WorkingDir, workspaceID)
+				if err != nil {
+					slog.Error("failed to check for a gated workspace on this config", "error", err)
+					respond.ErrorWithRequest(w, r, http.StatusInternalServerError, "failed to update workspace")
+					return
+				}
+			}
+			if !gatedOriginAllowed(vacates, originStillGated, userCtx.Role) {
+				respond.Error(w, http.StatusForbidden, gatedOriginMessage)
+				return
+			}
+		}
 	}
 
 	workspace, err := h.svc.Update(r.Context(), service.UpdateWorkspaceParams{
@@ -570,6 +875,41 @@ func (h *WorkspaceHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	userCtx := auth.GetUser(r.Context())
 	workspaceID := chi.URLParam(r, "workspaceID")
 
+	current, err := h.svc.Get(r.Context(), workspaceID, userCtx.OrgID)
+	if err != nil {
+		respond.FromError(w, r, err)
+		return
+	}
+
+	// A delete is a move to nowhere. What Update charges for is the config the
+	// workspace LEAVES: while a gated workspace sits on a repo + working_dir,
+	// gatedTwinAllowed refuses an ungated second one there, and removing the
+	// row retires that refusal exactly as walking it away does — then an
+	// ungated workspace goes up on the vacated config and applies with nobody
+	// signing.
+	//
+	// The route is workspace-scoped, so a workspace_team_access grant of admin
+	// on this one workspace clears it while the caller is an org operator
+	// everywhere else. gatedOriginAllowed reads the ORG role, the same one that
+	// signs a gated apply, so the grant that lets someone delete their own
+	// workspace does not also let them retire a production gate.
+	//
+	// Passing targetGated=false, sameTarget=false is the delete case stated in
+	// the update predicate's own terms: there is no destination, so it can
+	// neither be the same target nor carry the gate forward.
+	if vacatesGatedConfig(current, false, false) {
+		originStillGated, err := h.svc.HasGatedTwin(r.Context(), userCtx.OrgID, current.RepoURL, current.WorkingDir, workspaceID)
+		if err != nil {
+			slog.Error("failed to check for a gated workspace on this config", "error", err)
+			respond.ErrorWithRequest(w, r, http.StatusInternalServerError, "failed to delete workspace")
+			return
+		}
+		if !gatedOriginAllowed(true, originStillGated, userCtx.Role) {
+			respond.Error(w, http.StatusForbidden, gatedOriginDeleteMessage)
+			return
+		}
+	}
+
 	if err := h.svc.Delete(r.Context(), workspaceID, userCtx.OrgID); err != nil {
 		if errors.Is(err, service.ErrWorkspaceHasRuns) {
 			respond.Error(w, http.StatusConflict, "cannot delete workspace with existing runs")
@@ -622,6 +962,37 @@ func (h *WorkspaceHandler) Clone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A clone carries the source's approval-gate settings. Cloning an
+	// auto-applying workspace therefore hands the caller a second auto-applying
+	// workspace — one they can then repoint at any repo through Update, which
+	// sits at the operator bar. That is the create case, so it takes the create
+	// bar.
+	if !approvalGateAtCreateAllowed(source.AutoApply, userCtx.Role) {
+		respond.Error(w, http.StatusForbidden, "cloning a workspace with auto_apply requires admin role or higher")
+		return
+	}
+
+	requiresApproval, ok := cloneApprovalGate(source.RequiresApproval, req.RequiresApproval, userCtx.Role)
+	if !ok {
+		respond.Error(w, http.StatusForbidden, "cloning a workspace without its requires_approval gate requires admin role or higher")
+		return
+	}
+
+	// A clone copies the source's repo and working_dir, so cloning a gated
+	// workspace produces a gated one unless the request said otherwise. Cloning
+	// an ungated workspace that happens to sit on a config some OTHER workspace
+	// gates is the twin case, and takes the twin bar.
+	hasGatedTwin, err := h.svc.HasGatedTwin(r.Context(), userCtx.OrgID, source.RepoURL, source.WorkingDir, sourceID)
+	if err != nil {
+		slog.Error("failed to check for a gated workspace on this config", "error", err)
+		respond.ErrorWithRequest(w, r, http.StatusInternalServerError, "failed to clone workspace")
+		return
+	}
+	if !gatedTwinAllowed(hasGatedTwin, requiresApproval, userCtx.Role) {
+		respond.Error(w, http.StatusForbidden, gatedTwinMessage)
+		return
+	}
+
 	// Fall back to source values for optional fields
 	description := req.Description
 	if description == "" {
@@ -643,7 +1014,7 @@ func (h *WorkspaceHandler) Clone(w http.ResponseWriter, r *http.Request) {
 		TofuVersion:       source.TofuVersion,
 		Environment:       environment,
 		AutoApply:         source.AutoApply,
-		RequiresApproval:  source.RequiresApproval,
+		RequiresApproval:  requiresApproval,
 		VcsTriggerEnabled: source.VcsTriggerEnabled,
 		CreatedBy:         userCtx.UserID,
 	})

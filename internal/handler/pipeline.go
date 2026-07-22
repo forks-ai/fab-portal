@@ -2,8 +2,10 @@ package handler
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -205,9 +207,15 @@ func (h *PipelineHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A new pipeline has no stored stages, so every auto-apply stage on it is
+	// new authority.
+	if !h.authorizeStages(w, r, userCtx.OrgID, userCtx.Role, nil, req.Stages) {
+		return
+	}
+
 	pipeline, err := h.pipelineSvc.Create(r.Context(), userCtx.OrgID, req.Name, req.Description, userCtx.UserID, req.Stages)
 	if err != nil {
-		respond.Error(w, http.StatusInternalServerError, "failed to create pipeline")
+		respond.FromError(w, r, err)
 		return
 	}
 
@@ -277,9 +285,30 @@ func (h *PipelineHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Update replaces the whole stage list, so an edit that only renames the
+	// pipeline or reorders it still resubmits every stage's auto_apply. Only a
+	// stage that gains auto-apply is an authorization event — the same rule
+	// changesApprovalGate follows on the workspace form. Without the
+	// comparison, one admin-set auto-apply stage would freeze the pipeline
+	// against every later operator edit.
+	if req.Stages != nil {
+		if _, err := h.pipelineSvc.Get(r.Context(), pipelineID, userCtx.OrgID); err != nil {
+			respond.FromError(w, r, err)
+			return
+		}
+		currentStages, err := h.pipelineSvc.ListStages(r.Context(), pipelineID)
+		if err != nil {
+			respond.ErrorWithRequest(w, r, http.StatusInternalServerError, "failed to list stages")
+			return
+		}
+		if !h.authorizeStages(w, r, userCtx.OrgID, userCtx.Role, currentStages, req.Stages) {
+			return
+		}
+	}
+
 	pipeline, err := h.pipelineSvc.Update(r.Context(), pipelineID, userCtx.OrgID, req.Name, req.Description, req.Stages)
 	if err != nil {
-		respond.Error(w, http.StatusInternalServerError, "failed to update pipeline")
+		respond.FromError(w, r, err)
 		return
 	}
 
@@ -434,4 +463,133 @@ type PipelineDetailResponse struct {
 type PipelineRunDetailResponse struct {
 	PipelineRun PipelineRunResponse        `json:"pipeline_run"`
 	Stages      []PipelineRunStageResponse `json:"stages"`
+}
+
+// authorizeStages resolves every submitted stage's workspace inside the caller's
+// org and holds the stages that gain auto-apply to the bar those workspaces
+// carry. It writes the response and returns false when the write may not
+// proceed.
+func (h *PipelineHandler) authorizeStages(
+	w http.ResponseWriter, r *http.Request,
+	orgID, role string,
+	current []repository.PipelineStageWithWorkspace,
+	submitted []service.CreatePipelineStageInput,
+) bool {
+	seen := make(map[string]bool, len(submitted))
+	ids := make([]string, 0, len(submitted))
+	for _, s := range submitted {
+		if !seen[s.WorkspaceID] {
+			seen[s.WorkspaceID] = true
+			ids = append(ids, s.WorkspaceID)
+		}
+	}
+
+	rows, err := h.pipelineSvc.StageWorkspaceGates(r.Context(), orgID, ids)
+	if err != nil {
+		slog.Error("failed to resolve stage workspaces", "error", err)
+		respond.ErrorWithRequest(w, r, http.StatusInternalServerError, "failed to resolve stage workspaces")
+		return false
+	}
+	gates := make(map[string]repository.WorkspaceGateRow, len(rows))
+	for _, row := range rows {
+		gates[row.ID] = row
+	}
+
+	// A stage naming a workspace this org does not have is refused rather than
+	// stored: the auto-apply bar below is decided by what the target workspace
+	// is, so an unresolvable target must not fall through it.
+	for _, id := range ids {
+		if _, ok := gates[id]; !ok {
+			respond.Error(w, http.StatusBadRequest, "stage workspace not found: "+id)
+			return false
+		}
+	}
+
+	gaining := workspacesGainingAutoApply(current, submitted)
+	if len(gaining) == 0 {
+		return true
+	}
+	action, gatedNames := autoApplyStageBar(gates, gaining)
+	if auth.CanPerform(role, action) {
+		return true
+	}
+	if len(gatedNames) > 0 {
+		respond.Error(w, http.StatusForbidden,
+			"auto_apply on a stage targeting a workspace that requires approval ("+
+				strings.Join(gatedNames, ", ")+") requires admin role or higher")
+		return false
+	}
+	respond.Error(w, http.StatusForbidden, "setting auto_apply on a stage requires operator role or higher")
+	return false
+}
+
+// workspacesGainingAutoApply returns the workspaces a submitted stage list hands
+// auto-apply that they do not already hold on this pipeline, in submission
+// order.
+//
+// Stages carry no stable id across an update — the write deletes and recreates
+// the whole list — so identity is the workspace a stage targets, counted rather
+// than set-tested because a pipeline may run the same workspace twice. Any
+// workspace that would end up with more auto-applying stages than it has today
+// is new authority; reordering, renaming, changing on_failure, dropping a stage
+// or adding a non-auto one is not.
+func workspacesGainingAutoApply(current []repository.PipelineStageWithWorkspace, submitted []service.CreatePipelineStageInput) []string {
+	have := make(map[string]int, len(current))
+	for _, s := range current {
+		if s.AutoApply {
+			have[s.WorkspaceID]++
+		}
+	}
+	want := make(map[string]int, len(submitted))
+	var gaining []string
+	for _, s := range submitted {
+		if !s.AutoApply {
+			continue
+		}
+		want[s.WorkspaceID]++
+		if want[s.WorkspaceID] == have[s.WorkspaceID]+1 {
+			gaining = append(gaining, s.WorkspaceID)
+		}
+	}
+	return gaining
+}
+
+// autoApplyStageBar returns the action a caller must clear to hand these
+// workspaces auto-apply on a pipeline stage, plus the gated ones by name.
+//
+// A stage's auto_apply overrides the workspace's own setting for that run, so
+// writing it is the same act as flipping auto_apply on the workspace — and worth
+// exactly what that workspace's applies are worth.
+//
+// On an UNGATED workspace that is ActionApplyRun: the same caller may POST
+// {"operation":"apply"} on that workspace right now (handler/run.go, wsRun), so
+// a stage that applies it automatically hands out nothing they do not already
+// hold. Pinning it at admin would have made pipelines — the whole point of
+// which is running several applies in order — an admin-only feature for the
+// operators who build them, while leaving the manual equivalent open.
+//
+// On a GATED workspace it is ActionApplyProd. The override cannot actually open
+// that gate (postPlanAction checks requires_approval first, and the stage parks
+// at awaiting_approval regardless), so this bar guards a flag that is inert
+// today — deliberately, because it is the flag that would matter if that
+// ordering ever moved, and nobody with an operator's job needs to set it.
+// A workspace the caller's org does not have is refused before this runs; if one
+// reaches here anyway it counts as gated, so an unresolvable target can never be
+// the reason a stage got the lower bar.
+func autoApplyStageBar(gates map[string]repository.WorkspaceGateRow, gaining []string) (auth.Action, []string) {
+	var gatedNames []string
+	for _, id := range gaining {
+		g, ok := gates[id]
+		if !ok {
+			gatedNames = append(gatedNames, id)
+			continue
+		}
+		if g.RequiresApproval {
+			gatedNames = append(gatedNames, g.Name)
+		}
+	}
+	if len(gatedNames) > 0 {
+		return auth.ActionApplyProd, gatedNames
+	}
+	return auth.ActionApplyRun, nil
 }

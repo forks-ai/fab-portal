@@ -2,7 +2,10 @@
 
 package repository
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 const workspaceColumns = `id, org_id, name, description, repo_url, repo_branch, working_dir, tofu_version, environment, auto_apply, requires_approval, vcs_trigger_enabled, locked, locked_by, current_run_id, created_by, source, current_config_version_id, created_at, updated_at`
 
@@ -26,6 +29,43 @@ func (q *Queries) GetWorkspace(ctx context.Context, arg GetWorkspaceParams) (Wor
 		arg.ID, arg.OrgID,
 	)
 	return scanWorkspace(row)
+}
+
+// WorkspaceGateRow names a workspace and says whether it gates its applies. It
+// is what an authorization check needs about a workspace it is not otherwise
+// reading — the id to match on, the name to put in an error message, and the
+// gate to decide the bar.
+type WorkspaceGateRow struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	RequiresApproval bool   `json:"requires_approval"`
+}
+
+// ListWorkspaceGates returns the gate rows for the named workspaces in one org.
+// Ids that name nothing in this org are simply absent from the result, so a
+// caller can tell "not mine" from "mine and ungated" and refuse the first.
+func (q *Queries) ListWorkspaceGates(ctx context.Context, orgID string, ids []string) ([]WorkspaceGateRow, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := q.db.Query(ctx,
+		`SELECT id, name, requires_approval FROM workspaces WHERE org_id = $1 AND id = ANY($2)`,
+		orgID, ids,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var gates []WorkspaceGateRow
+	for rows.Next() {
+		var g WorkspaceGateRow
+		if err := rows.Scan(&g.ID, &g.Name, &g.RequiresApproval); err != nil {
+			return nil, err
+		}
+		gates = append(gates, g)
+	}
+	return gates, rows.Err()
 }
 
 type ListWorkspacesParams struct {
@@ -195,14 +235,55 @@ func (q *Queries) SetWorkspaceCurrentRun(ctx context.Context, arg SetWorkspaceCu
 
 // ClaimWorkspaceForRun atomically takes the workspace's single run slot for
 // runID, but only if the slot is free. Returns the workspace id when claimed and
-// pgx.ErrNoRows when another run already holds it. The conditional UPDATE
-// serializes concurrent claimers on the workspace row — the basis for run
+// pgx.ErrNoRows when ANY run holds it — including runID itself. The conditional
+// UPDATE serializes concurrent claimers on the workspace row — the basis for run
 // serialization, so two runs can never execute against the same tofu state.
+//
+// The predicate is mutual exclusion, and it has to stay that way. Postgres
+// re-evaluates it against the committed row when a blocked claimer gets the
+// lock, so "free" is the only condition under which a second claimer for the
+// same run id can be refused. A predicate that also accepted the caller's own
+// run id would let two callers that read the same pending run both claim it and
+// both enqueue it — nothing downstream catches that: RunJobArgs declares no
+// UniqueOpts, RunJobWorker.Work takes no lock, and UpdateRunStarted has no
+// status guard, so the two jobs run one tofu state concurrently.
+//
+// The one caller that legitimately needs to re-take a slot it already holds is
+// the approval path, and it has its own query for that — ReclaimWorkspaceForRun.
 func (q *Queries) ClaimWorkspaceForRun(ctx context.Context, id, orgID, runID string) (string, error) {
 	var claimed string
 	err := q.db.QueryRow(ctx,
 		`UPDATE workspaces SET current_run_id = $3, updated_at = NOW()
 		 WHERE id = $1 AND org_id = $2 AND current_run_id IS NULL
+		 RETURNING id`,
+		id, orgID, runID,
+	).Scan(&claimed)
+	return claimed, err
+}
+
+// ReclaimWorkspaceForRun is ClaimWorkspaceForRun widened by exactly one case:
+// the slot may also be taken when runID is already the holder. Returns
+// pgx.ErrNoRows only when a DIFFERENT run holds it.
+//
+// It exists for the approval path and belongs to nothing else. A plan that
+// parked at awaiting_approval normally released the slot on its way there, but
+// that release is best-effort — the worker logs a failed ReleaseWorkspaceRun and
+// moves on — so a plan can sit waiting for a signature while still holding its
+// own slot. Under the strict claim the approval could never take it and the run
+// would be parked behind itself until the stale-slot reaper came around hours
+// later.
+//
+// Widening the predicate here is safe in a way it is not in the hand-off,
+// because the approval transaction is already exclusive on the run: it holds the
+// run row FOR UPDATE and admits only 'planned' / 'awaiting_approval', so a
+// second approval of the same run reads it as 'queued' and is refused before it
+// ever reaches this claim. Re-taking a slot the caller already holds grants
+// nothing either — the holder is this run, so no other run can be executing.
+func (q *Queries) ReclaimWorkspaceForRun(ctx context.Context, id, orgID, runID string) (string, error) {
+	var claimed string
+	err := q.db.QueryRow(ctx,
+		`UPDATE workspaces SET current_run_id = $3, updated_at = NOW()
+		 WHERE id = $1 AND org_id = $2 AND (current_run_id IS NULL OR current_run_id = $3)
 		 RETURNING id`,
 		id, orgID, runID,
 	).Scan(&claimed)
@@ -361,4 +442,168 @@ func (q *Queries) FindWorkspacesByRepo(ctx context.Context, arg FindWorkspacesBy
 		workspaces = []Workspace{}
 	}
 	return workspaces, rows.Err()
+}
+
+// A workspace is only a name for "this config, at this path". Two workspaces
+// pointing at the same repo and the same working_dir drive the same backend —
+// terragrunt declares remote_state in the tree itself — so they are two doors
+// onto one piece of infrastructure. These expressions reduce both halves of
+// that identity to a canonical form, so the same target spelled differently
+// still compares equal.
+//
+// repoURLIdentitySQL runs in two halves, inside-out.
+//
+// First the origin is reduced to "host/path": lowercase, drop a default-looking
+// port from a URL that carries a scheme, drop the scheme, drop any userinfo (a
+// URL carrying a token is the same repo), then turn scp-style "host:path" into
+// "host/path". The port is stripped while the scheme is still attached, and
+// only then, so the scp-style rule that follows cannot mistake a numeric path
+// segment for one: "git@github.com:2600/repo" is a repo owned by "2600", not a
+// port.
+//
+// Then the path is folded the way the remote folds it — the same three rewrites
+// workingDirIdentitySQL applies, for the same reason. A git path is resolved as
+// a path at the far end, so "github.com/acme//infra",
+// "github.com/acme/./infra" and "github.com/acme/infra/." all serve the tree
+// that "github.com/acme/infra" serves, and every one of them clones. Folding
+// the path also has to happen before the ".git" suffix comes off, or
+// ".../infra.git/." keeps its suffix and reads as another repo. The scheme's
+// own "//" is gone by then, so collapsing repeated slashes cannot touch it.
+//
+// All of these land on "github.com/acme/infra":
+//
+//	https://github.com/acme/infra.git     ssh://git@github.com/acme/infra
+//	https://TOKEN@github.com/acme/infra/   git@github.com:acme/infra.git
+//	https://github.com:443/acme/infra.git  ssh://git@github.com:22/acme/infra
+//	https://github.com/acme//infra         https://github.com/acme/./infra
+//	https://github.com/acme/infra.git/.    https://github.com/acme/infra//
+//
+// It normalises spelling, not remote identity: a mirror under a different host
+// or path is a different string and stays one. The check narrows the gap
+// structurally, it does not close it by proof.
+const (
+	repoURLIdentitySQL = `RTRIM(REGEXP_REPLACE(
+		RTRIM(
+			REGEXP_REPLACE(
+				REGEXP_REPLACE(
+					REGEXP_REPLACE(
+						REGEXP_REPLACE(
+							REGEXP_REPLACE(
+								REGEXP_REPLACE(
+									REGEXP_REPLACE(LOWER(%s),
+									'^([a-z][a-z0-9+.-]*://[^/]*):[0-9]+(/|$)', '\1\2'),
+								'^[a-z][a-z0-9+.-]*://', ''),
+							'^[^/@]*@', ''),
+						'^([^/:]+):', '\1/'),
+					'/+', '/', 'g'),
+				'(^|/)(\./)+', '\1', 'g'),
+			'(^|/)\.$', '\1'),
+		'/'),
+	'\.git$', ''), '/')`
+
+	// A leaf is one directory under every spelling of it. Applied outside-in:
+	// collapse repeated slashes, drop a leading slash, drop every "." segment,
+	// drop a trailing "/.", then trim the trailing slash and read an empty
+	// result as the repo root.
+	//
+	//	"", ".", "./", "/"                                           -> "."
+	//	"envs/production", "./envs/production", "/envs/production"   -> "envs/production"
+	//	"envs//production", "envs/./production", "envs/production/." -> "envs/production"
+	//
+	// Portal canonicalises the column on write (service.CanonicalWorkingDir), so
+	// in practice both sides of the comparison already agree; this is what makes
+	// that true for a row written before the column was canonical, and it is
+	// what a hand-run query against the table gets as well.
+	workingDirIdentitySQL = `COALESCE(NULLIF(BTRIM(
+		REGEXP_REPLACE(
+			REGEXP_REPLACE(
+				REGEXP_REPLACE(
+					REGEXP_REPLACE(%s, '/+', '/', 'g'),
+				'^/', ''),
+			'(^|/)(\./)+', '\1', 'g'),
+		'(^|/)\.$', '\1'),
+	'/'), ''), '.')`
+)
+
+type GatedTwinParams struct {
+	OrgID      string `json:"org_id"`
+	RepoURL    string `json:"repo_url"`
+	WorkingDir string `json:"working_dir"`
+	ExcludeID  string `json:"exclude_id"`
+}
+
+// HasGatedWorkspaceForConfig reports whether some OTHER workspace in this org
+// already gates this exact repo + working_dir behind an approval.
+//
+// Both sides of each comparison run through the same normalising expression, so
+// the check cannot be dodged by spelling the repo URL or the working directory
+// differently — a respelled path resolves to the same `cd` in the executor, so
+// it has to resolve to the same row here.
+//
+// An empty repo_url means an upload workspace, which has no comparable config
+// identity; the query returns false rather than matching every other upload
+// workspace in the org.
+func (q *Queries) HasGatedWorkspaceForConfig(ctx context.Context, arg GatedTwinParams) (bool, error) {
+	if arg.RepoURL == "" {
+		return false, nil
+	}
+	repoCol := fmt.Sprintf(repoURLIdentitySQL, "repo_url")
+	repoArg := fmt.Sprintf(repoURLIdentitySQL, "$2::TEXT")
+	dirCol := fmt.Sprintf(workingDirIdentitySQL, "working_dir")
+	dirArg := fmt.Sprintf(workingDirIdentitySQL, "$3::TEXT")
+
+	row := q.db.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM workspaces
+			WHERE org_id = $1
+			  AND id <> $4
+			  AND requires_approval = TRUE
+			  AND repo_url <> ''
+			  AND `+repoCol+` = `+repoArg+`
+			  AND `+dirCol+` = `+dirArg+`
+		)`,
+		arg.OrgID, arg.RepoURL, arg.WorkingDir, arg.ExcludeID,
+	)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+type ConfigTargetsMatchParams struct {
+	RepoURLA    string `json:"repo_url_a"`
+	WorkingDirA string `json:"working_dir_a"`
+	RepoURLB    string `json:"repo_url_b"`
+	WorkingDirB string `json:"working_dir_b"`
+}
+
+// ConfigTargetsMatch reports whether two (repo_url, working_dir) pairs name the
+// same config, under exactly the identity rules HasGatedWorkspaceForConfig
+// compares rows by.
+//
+// Callers that have to know whether an update MOVES a workspace need the same
+// answer the gated-twin check would give, and there is one definition of that:
+// this runs the same two expressions rather than restating them in Go, where
+// the two spellings of "same config" could drift apart. A workspace resubmitted
+// under an equivalent spelling of its own target has not moved, and must not be
+// charged for a move.
+//
+// An empty repo_url on either side is an upload workspace, which has no
+// comparable config identity — the same reading HasGatedWorkspaceForConfig
+// takes — so it matches nothing, itself included.
+func (q *Queries) ConfigTargetsMatch(ctx context.Context, arg ConfigTargetsMatchParams) (bool, error) {
+	if arg.RepoURLA == "" || arg.RepoURLB == "" {
+		return false, nil
+	}
+	repoA := fmt.Sprintf(repoURLIdentitySQL, "$1::TEXT")
+	repoB := fmt.Sprintf(repoURLIdentitySQL, "$3::TEXT")
+	dirA := fmt.Sprintf(workingDirIdentitySQL, "$2::TEXT")
+	dirB := fmt.Sprintf(workingDirIdentitySQL, "$4::TEXT")
+
+	row := q.db.QueryRow(ctx,
+		`SELECT `+repoA+` = `+repoB+` AND `+dirA+` = `+dirB,
+		arg.RepoURLA, arg.WorkingDirA, arg.RepoURLB, arg.WorkingDirB,
+	)
+	var same bool
+	err := row.Scan(&same)
+	return same, err
 }

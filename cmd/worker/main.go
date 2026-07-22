@@ -177,11 +177,10 @@ func main() {
 		})
 	}
 	importOutputsFn := func(ctx context.Context, sourceWorkspaceID, targetWorkspaceID, orgID string) error {
-		_, err := workspaceSvc.ImportOutputs(ctx, service.ImportOutputsParams{
+		_, _, err := workspaceSvc.ImportOutputs(ctx, service.ImportOutputsParams{
 			SourceWorkspaceID: sourceWorkspaceID,
 			TargetWorkspaceID: targetWorkspaceID,
 			OrgID:             orgID,
-			SkipSensitive:     true,
 			DescriptionSource: "pipeline stage",
 		})
 		return err

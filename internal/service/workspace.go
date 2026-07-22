@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/oklog/ulid/v2"
@@ -29,6 +31,11 @@ type WorkspaceService struct {
 	storage *storage.S3Storage
 }
 
+// NewWorkspaceService builds the workspace domain. The store is what output
+// import reads state through; without one the import paths return
+// ErrStorageNotConfigured. No encryptor: variable ciphertext is copied between
+// workspaces as-is, and state outputs the source marked sensitive arrive
+// already redacted, so nothing here ever holds a plaintext secret.
 func NewWorkspaceService(queries *repository.Queries, db *pgxpool.Pool, store *storage.S3Storage) *WorkspaceService {
 	return &WorkspaceService{queries: queries, db: db, storage: store}
 }
@@ -97,6 +104,80 @@ func (s *WorkspaceService) Get(ctx context.Context, id, orgID string) (repositor
 	})
 }
 
+// CanonicalWorkingDir reduces a working directory to the one spelling that
+// names that leaf.
+//
+// "envs/production", "./envs/production", "envs//production",
+// "envs/./production", "envs/production/" and "envs/production/." are one
+// directory to both executors — the local one joins the path with
+// filepath.Join, which cleans it, and the Kubernetes one emits
+// `cd "/work/$PORTAL_WORKING_DIR"`, where `cd envs//production` and
+// `cd envs/./production` are the same cd in /bin/sh. So they have to be one
+// string to portal too: the gated-twin check compares stored working_dir
+// values, and a comparison that reads those as different targets is a second
+// door onto gated infrastructure that anyone who may create a workspace can
+// open by respelling the path. Canonicalising on the way in means the column
+// only ever holds one spelling of a leaf, so the comparison sees the target and
+// not the typing.
+//
+// Rooting the path before cleaning also neutralises "..": path.Clean resolves
+// it against "/" and can never climb above it, so a caller who reaches this
+// without the handler's validation still cannot name anything outside the
+// checkout.
+//
+// Empty in, empty out. An omitted field is a request to keep the stored value,
+// not a request to point at the repo root; Create fills the "." default itself.
+func CanonicalWorkingDir(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	cleaned := strings.TrimPrefix(path.Clean("/"+dir), "/")
+	if cleaned == "" {
+		return "."
+	}
+	return cleaned
+}
+
+// HasGatedTwin reports whether another workspace in this org already gates the
+// same repo + working_dir behind an approval.
+//
+// The workspace row is a label on a config, not a boundary around it: with
+// terragrunt the backend is declared in the repo, so two workspaces on the same
+// path share one remote state and one set of real resources. Without this,
+// requires_approval is a property of a row anyone may stand up a second copy
+// of.
+//
+// The working directory is canonicalised here as well as on write, so a query
+// spelled "envs//production" is asked about the same leaf the column stores as
+// "envs/production". The repo URL is not: it is a clone target, and rewriting
+// it would break a URL that carries its own credentials or an scp-style remote,
+// so its spellings are collapsed inside the query instead.
+//
+// excludeID keeps a workspace from matching itself on update.
+func (s *WorkspaceService) HasGatedTwin(ctx context.Context, orgID, repoURL, workingDir, excludeID string) (bool, error) {
+	return s.queries.HasGatedWorkspaceForConfig(ctx, repository.GatedTwinParams{
+		OrgID:      orgID,
+		RepoURL:    repoURL,
+		WorkingDir: CanonicalWorkingDir(workingDir),
+		ExcludeID:  excludeID,
+	})
+}
+
+// SameConfigTarget reports whether two (repo_url, working_dir) pairs name the
+// same config, by the identity rules HasGatedTwin compares rows by.
+//
+// It answers "did this update actually move the workspace" for the callers that
+// have to charge for a move, so a settings save that respells its own target —
+// dropping a ".git", adding a trailing slash — is not read as one.
+func (s *WorkspaceService) SameConfigTarget(ctx context.Context, repoA, dirA, repoB, dirB string) (bool, error) {
+	return s.queries.ConfigTargetsMatch(ctx, repository.ConfigTargetsMatchParams{
+		RepoURLA:    repoA,
+		WorkingDirA: CanonicalWorkingDir(dirA),
+		RepoURLB:    repoB,
+		WorkingDirB: CanonicalWorkingDir(dirB),
+	})
+}
+
 func (s *WorkspaceService) Create(ctx context.Context, params CreateWorkspaceParams) (repository.Workspace, error) {
 	source := params.Source
 	if source == "" {
@@ -106,7 +187,7 @@ func (s *WorkspaceService) Create(ctx context.Context, params CreateWorkspacePar
 	if branch == "" && source == "vcs" {
 		branch = "main"
 	}
-	workDir := params.WorkingDir
+	workDir := CanonicalWorkingDir(params.WorkingDir)
 	if workDir == "" {
 		workDir = "."
 	}
@@ -137,6 +218,11 @@ func (s *WorkspaceService) Create(ctx context.Context, params CreateWorkspacePar
 	})
 }
 
+// Update writes the fields a request carried. Empty strings mean "keep what is
+// stored" (the query COALESCEs them), so the working directory is canonicalised
+// only when one was actually supplied — CanonicalWorkingDir leaves empty empty
+// so an omitted field stays omitted rather than becoming a move to the repo
+// root.
 func (s *WorkspaceService) Update(ctx context.Context, params UpdateWorkspaceParams) (repository.Workspace, error) {
 	return s.queries.UpdateWorkspace(ctx, repository.UpdateWorkspaceParams{
 		ID:                params.ID,
@@ -145,7 +231,7 @@ func (s *WorkspaceService) Update(ctx context.Context, params UpdateWorkspacePar
 		Description:       params.Description,
 		RepoURL:           params.RepoURL,
 		RepoBranch:        params.RepoBranch,
-		WorkingDir:        params.WorkingDir,
+		WorkingDir:        CanonicalWorkingDir(params.WorkingDir),
 		TofuVersion:       params.TofuVersion,
 		Environment:       params.Environment,
 		AutoApply:         params.AutoApply,
@@ -261,7 +347,7 @@ func (s *WorkspaceService) CopyInto(ctx context.Context, sourceID, targetID, org
 		var v repository.WorkspaceVariable
 		if existing, ok := existingByKey[sv.Key+"|"+sv.Category]; ok {
 			v, err = qtx.UpdateWorkspaceVariable(ctx, repository.UpdateWorkspaceVariableParams{
-				ID: existing.ID, OrgID: orgID,
+				ID: existing.ID, WorkspaceID: targetID, OrgID: orgID,
 				Value: sv.Value, Sensitive: sv.Sensitive, Description: sv.Description,
 			})
 		} else {
@@ -294,53 +380,86 @@ type ImportOutputsParams struct {
 	SourceWorkspaceID string
 	TargetWorkspaceID string
 	OrgID             string
-	// SkipSensitive drops outputs marked sensitive in state instead of storing
-	// their values as plaintext variables. Pipeline stage imports skip them; the
-	// explicit import endpoint brings everything the operator asked for across.
-	SkipSensitive bool
 	// DescriptionSource names where each imported value came from in the
 	// variable's description, e.g. "workspace" or "pipeline stage".
 	DescriptionSource string
 }
 
+// importableOutputs splits parsed state outputs into the ones that can become
+// variables and a count of the ones that cannot.
+//
+// tfstate.ParseOutputs blanks the value of every output the state marks
+// sensitive, so by the time an output reaches here a sensitive one carries no
+// value at all. Importing it would store the JSON encoding of nothing — the
+// four characters "null" — under the source's key, and the worker would hand
+// that to the next run as TF_VAR_<key>=null. There is nothing to import once
+// the parser has redacted it, so sensitive outputs are dropped here and
+// counted, and the caller says so rather than writing a plausible-looking
+// variable whose content is garbage.
+func importableOutputs(outputs []tfstate.Output) ([]tfstate.Output, int) {
+	importable := make([]tfstate.Output, 0, len(outputs))
+	skipped := 0
+	for _, out := range outputs {
+		if out.Sensitive {
+			skipped++
+			continue
+		}
+		importable = append(importable, out)
+	}
+	return importable, skipped
+}
+
 // ImportOutputs reads the source workspace's latest state, parses its outputs,
-// and upserts each one as a terraform-category variable on the target (update
-// by key when it exists, create otherwise). Both the import-outputs endpoint
-// and pipeline stage advancement run through here. A failed upsert is logged
-// and skipped so one bad output doesn't abort the rest; the returned slice
-// holds the variables actually written. A source with no outputs returns an
-// empty result — callers decide whether that is an error.
-func (s *WorkspaceService) ImportOutputs(ctx context.Context, params ImportOutputsParams) ([]repository.WorkspaceVariable, error) {
+// and upserts each importable one as a terraform-category variable on the
+// target (update by key when it exists, create otherwise). Both the
+// import-outputs endpoint and pipeline stage advancement run through here. A
+// failed upsert is logged and skipped so one bad output doesn't abort the rest.
+//
+// It returns the variables actually written and how many outputs were dropped
+// for being sensitive — state redacts those, so there is no value to carry
+// across. A source with no outputs returns an empty result; callers decide
+// whether that is an error.
+func (s *WorkspaceService) ImportOutputs(ctx context.Context, params ImportOutputsParams) ([]repository.WorkspaceVariable, int, error) {
 	if s.storage == nil {
-		return nil, ErrStorageNotConfigured
+		return nil, 0, ErrStorageNotConfigured
 	}
 
 	sv, err := s.queries.GetLatestStateVersion(ctx, repository.GetLatestStateVersionParams{
 		WorkspaceID: params.SourceWorkspaceID, OrgID: params.OrgID,
 	})
 	if err != nil {
-		return nil, apperr.Wrap(apperr.KindNotFound, "source workspace has no state", err)
+		return nil, 0, apperr.Wrap(apperr.KindNotFound, "source workspace has no state", err)
 	}
 
 	data, err := s.storage.GetState(ctx, sv.StateURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetch source state: %w", err)
+		return nil, 0, fmt.Errorf("fetch source state: %w", err)
 	}
 
 	outputs, err := tfstate.ParseOutputs(data)
 	if err != nil {
-		return nil, fmt.Errorf("parse source outputs: %w", err)
+		return nil, 0, fmt.Errorf("parse source outputs: %w", err)
 	}
 	if len(outputs) == 0 {
 		slog.Info("no outputs to import", "source_workspace", params.SourceWorkspaceID, "target_workspace", params.TargetWorkspaceID)
-		return nil, nil
+		return nil, 0, nil
+	}
+
+	outputs, skippedSensitive := importableOutputs(outputs)
+	if skippedSensitive > 0 {
+		slog.Info("skipped sensitive outputs on import: state redacts their values",
+			"source_workspace", params.SourceWorkspaceID, "target_workspace", params.TargetWorkspaceID,
+			"skipped", skippedSensitive)
+	}
+	if len(outputs) == 0 {
+		return nil, skippedSensitive, nil
 	}
 
 	existing, err := s.queries.ListWorkspaceVariables(ctx, repository.ListWorkspaceVariablesParams{
 		WorkspaceID: params.TargetWorkspaceID, OrgID: params.OrgID,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list target variables: %w", err)
+		return nil, skippedSensitive, fmt.Errorf("list target variables: %w", err)
 	}
 	existingByKey := make(map[string]repository.WorkspaceVariable, len(existing))
 	for _, v := range existing {
@@ -351,10 +470,6 @@ func (s *WorkspaceService) ImportOutputs(ctx context.Context, params ImportOutpu
 
 	affected := make([]repository.WorkspaceVariable, 0, len(outputs))
 	for _, out := range outputs {
-		if params.SkipSensitive && out.Sensitive {
-			continue
-		}
-
 		// Non-string outputs (lists, maps, numbers) are stored as their JSON
 		// encoding, which is also how tofu expects complex variable values.
 		var valueStr string
@@ -368,10 +483,15 @@ func (s *WorkspaceService) ImportOutputs(ctx context.Context, params ImportOutpu
 
 		desc := fmt.Sprintf("Imported from %s output (%s)", params.DescriptionSource, out.Type)
 
+		// Everything that gets here is a value the source state published in
+		// the clear, so it is stored in the clear: marking it sensitive would
+		// hide a public value behind the reveal endpoint without protecting
+		// anything.
 		var v repository.WorkspaceVariable
 		if ev, exists := existingByKey[out.Name]; exists {
 			v, err = s.queries.UpdateWorkspaceVariable(ctx, repository.UpdateWorkspaceVariableParams{
-				ID: ev.ID, OrgID: params.OrgID, Value: valueStr, Sensitive: false, Description: desc,
+				ID: ev.ID, WorkspaceID: params.TargetWorkspaceID, OrgID: params.OrgID,
+				Value: valueStr, Sensitive: false, Description: desc,
 			})
 		} else {
 			v, err = s.queries.CreateWorkspaceVariable(ctx, repository.CreateWorkspaceVariableParams{
@@ -393,6 +513,7 @@ func (s *WorkspaceService) ImportOutputs(ctx context.Context, params ImportOutpu
 	}
 
 	slog.Info("imported outputs between workspaces",
-		"source", params.SourceWorkspaceID, "target", params.TargetWorkspaceID, "imported", len(affected))
-	return affected, nil
+		"source", params.SourceWorkspaceID, "target", params.TargetWorkspaceID,
+		"imported", len(affected), "skipped_sensitive", skippedSensitive)
+	return affected, skippedSensitive, nil
 }

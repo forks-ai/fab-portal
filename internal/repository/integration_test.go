@@ -6,8 +6,11 @@
 //
 // They need a database. Set TEST_DATABASE_URL to a server the test can create a
 // scratch database on (it connects to it, CREATE DATABASE portal_repo_test,
-// migrates, and drops it afterward). With no reachable server the whole package
-// skips, so `go test ./...` stays green without one.
+// migrates, and drops it afterward). Without it the package falls back to the
+// dev default and skips when nothing is listening, so `go test ./...` stays
+// green on a machine with no Postgres. Setting it and having it not answer is a
+// hard failure, not a skip — a tier that silently didn't run must not report
+// green.
 package repository_test
 
 import (
@@ -36,16 +39,24 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	base := os.Getenv("TEST_DATABASE_URL")
+	// An explicitly set TEST_DATABASE_URL is a caller saying "run the DB tier
+	// against this" — CI does exactly that. Falling back to skips when that
+	// server turns out to be unreachable would report a green run for tests that
+	// never executed, so an unusable explicit URL is fatal below. The dev default
+	// is a guess, and a guess that misses is allowed to skip.
+	base, pinned := os.LookupEnv("TEST_DATABASE_URL")
 	if base == "" {
 		base = "postgres://portal:portal@localhost:5432/postgres?sslmode=disable"
+		pinned = false
 	}
 	ctx := context.Background()
 
 	admin, err := pgx.Connect(ctx, base)
 	if err != nil {
-		// No reachable server — leave testPool nil; requireDB() skips each test.
-		os.Exit(m.Run())
+		if pinned {
+			panic("TEST_DATABASE_URL is set but unreachable, refusing to skip the DB tier: " + err.Error())
+		}
+		os.Exit(m.Run()) // no server and none asked for — DB tests skip via requireDB
 	}
 	const dbName = "portal_repo_test"
 	_, _ = admin.Exec(ctx, "DROP DATABASE IF EXISTS "+dbName)
@@ -121,7 +132,10 @@ func seedOrg(t *testing.T, ctx context.Context, slug string) (orgID, userID stri
 func seedWorkspace(t *testing.T, ctx context.Context, orgID, userID string) string {
 	t.Helper()
 	wsID := id()
-	exec(t, ctx, `INSERT INTO workspaces (id,org_id,name,created_by) VALUES ($1,$2,$3,$4)`, wsID, orgID, "ws-"+id()[:8], userID)
+	// Name off the full ULID: workspaces are unique on (org_id, name), and a
+	// ULID prefix is the shared timestamp, so two workspaces seeded in the same
+	// org in the same millisecond would collide.
+	exec(t, ctx, `INSERT INTO workspaces (id,org_id,name,created_by) VALUES ($1,$2,$3,$4)`, wsID, orgID, "ws-"+wsID, userID)
 	return wsID
 }
 
@@ -130,6 +144,19 @@ func seedRun(t *testing.T, ctx context.Context, wsID, orgID, userID string) stri
 	runID := id()
 	exec(t, ctx, `INSERT INTO runs (id,workspace_id,org_id,operation,status,created_by) VALUES ($1,$2,$3,'plan','pending',$4)`, runID, wsID, orgID, userID)
 	return runID
+}
+
+// currentRunID reads the workspace's run slot, "" when it is free.
+func currentRunID(t *testing.T, ctx context.Context, wsID string) string {
+	t.Helper()
+	var current *string
+	if err := testPool.QueryRow(ctx, `SELECT current_run_id FROM workspaces WHERE id = $1`, wsID).Scan(&current); err != nil {
+		t.Fatalf("read workspace slot: %v", err)
+	}
+	if current == nil {
+		return ""
+	}
+	return *current
 }
 
 func exec(t *testing.T, ctx context.Context, sql string, args ...any) {
@@ -203,6 +230,57 @@ func TestWorkspaceRunClaim(t *testing.T) {
 	}
 	if _, err := testQueries.ClaimWorkspaceForRun(ctx, wsID, orgID, r2); err != nil {
 		t.Fatalf("r2 should claim the freed slot, got: %v", err)
+	}
+}
+
+// TestWorkspaceRunClaimRefusesItsOwnHolder pins the exclusion the enqueue paths
+// are built on: the claim succeeds for at most one caller per held slot, and
+// that includes a second caller naming the run that already holds it.
+//
+// The hand-off (ClaimAndEnqueueNextRun) reads the oldest pending run without a
+// row lock, so two callers routinely reach the claim with the same run id. Only
+// the predicate separates them — Postgres re-checks it against the committed row
+// when the second caller gets the workspace lock, and "the slot is free" is the
+// only condition that fails there. Accept the caller's own run id and both
+// enqueue it: two River jobs, no dedupe, two tofu processes on one state file.
+func TestWorkspaceRunClaimRefusesItsOwnHolder(t *testing.T) {
+	requireDB(t)
+	ctx := context.Background()
+	orgID, userID := seedOrg(t, ctx, "claim-self")
+	wsID := seedWorkspace(t, ctx, orgID, userID)
+	r1 := seedRun(t, ctx, wsID, orgID, userID)
+
+	if _, err := testQueries.ClaimWorkspaceForRun(ctx, wsID, orgID, r1); err != nil {
+		t.Fatalf("first claim should win, got: %v", err)
+	}
+	if _, err := testQueries.ClaimWorkspaceForRun(ctx, wsID, orgID, r1); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("re-claiming a held slot for its own holder must return no rows, got: %v", err)
+	}
+}
+
+// TestReclaimWorkspaceForRun covers the approval path's widened claim: it takes
+// a free slot, takes back one the same run already holds — the case a plan whose
+// release failed would otherwise be parked behind forever — and still refuses a
+// slot held by anything else.
+func TestReclaimWorkspaceForRun(t *testing.T) {
+	requireDB(t)
+	ctx := context.Background()
+	orgID, userID := seedOrg(t, ctx, "reclaim")
+	wsID := seedWorkspace(t, ctx, orgID, userID)
+	r1 := seedRun(t, ctx, wsID, orgID, userID)
+	r2 := seedRun(t, ctx, wsID, orgID, userID)
+
+	if _, err := testQueries.ReclaimWorkspaceForRun(ctx, wsID, orgID, r1); err != nil {
+		t.Fatalf("reclaim of a free slot should win, got: %v", err)
+	}
+	if _, err := testQueries.ReclaimWorkspaceForRun(ctx, wsID, orgID, r1); err != nil {
+		t.Fatalf("the holder must be able to re-take its own slot, got: %v", err)
+	}
+	if _, err := testQueries.ReclaimWorkspaceForRun(ctx, wsID, orgID, r2); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("reclaim by a different run must return no rows, got: %v", err)
+	}
+	if got := currentRunID(t, ctx, wsID); got != r1 {
+		t.Fatalf("workspace slot = %q, want the original holder (%q)", got, r1)
 	}
 }
 
@@ -363,11 +441,14 @@ func TestExpireClusterOperation(t *testing.T) {
 }
 
 // seedTeamMember creates a team in an org and puts a user in it.
-func seedTeamMember(t *testing.T, ctx context.Context, orgID, userID string) string {
+// seedTeamMember creates a team and puts the user in it with the given role
+// within the team. That in-team role caps any grant the team holds, so it is a
+// parameter rather than a fixed value.
+func seedTeamMember(t *testing.T, ctx context.Context, orgID, userID, memberRole string) string {
 	t.Helper()
 	teamID := id()
-	exec(t, ctx, `INSERT INTO teams (id,org_id,name,slug) VALUES ($1,$2,$3,$4)`, teamID, orgID, "team-"+teamID[:8], "team-"+teamID)
-	exec(t, ctx, `INSERT INTO team_members (id,team_id,user_id,role) VALUES ($1,$2,$3,'viewer')`, id(), teamID, userID)
+	exec(t, ctx, `INSERT INTO teams (id,org_id,name,slug) VALUES ($1,$2,$3,$4)`, teamID, orgID, "team-"+teamID, "team-"+teamID)
+	exec(t, ctx, `INSERT INTO team_members (id,team_id,user_id,role) VALUES ($1,$2,$3,$4)`, id(), teamID, userID, memberRole)
 	return teamID
 }
 
@@ -390,18 +471,42 @@ func TestGetWorkspaceTeamRole(t *testing.T) {
 		t.Fatalf("ungranted workspace returned role %q, want empty", role)
 	}
 
-	teamID := seedTeamMember(t, ctx, orgA, userA)
+	teamID := seedTeamMember(t, ctx, orgA, userA, "operator")
 	exec(t, ctx, `INSERT INTO workspace_team_access (id,workspace_id,team_id,role) VALUES ($1,$2,$3,'operator')`, id(), wsID, teamID)
 
 	if role, err = testQueries.GetWorkspaceTeamRole(ctx, wsID, userA, orgA); err != nil || role != "operator" {
 		t.Fatalf("granted workspace returned (%q, %v), want operator", role, err)
 	}
 
-	// A second team grants more: the highest grant wins, not the newest.
-	higherTeam := seedTeamMember(t, ctx, orgA, userA)
+	// The in-team role caps the grant. A team granted operator hands operator to
+	// its operators and viewer to its viewers — the members panel and the
+	// authority a member actually holds say the same thing.
+	cappedUser := id()
+	exec(t, ctx, `INSERT INTO users (id,org_id,email,name,role) VALUES ($1,$2,$3,'U','viewer')`, cappedUser, orgA, cappedUser+"@t.local")
+	exec(t, ctx, `INSERT INTO team_members (id,team_id,user_id,role) VALUES ($1,$2,$3,'viewer')`, id(), teamID, cappedUser)
+	if role, err = testQueries.GetWorkspaceTeamRole(ctx, wsID, cappedUser, orgA); err != nil || role != "viewer" {
+		t.Fatalf("viewer in an operator-granted team returned (%q, %v), want viewer", role, err)
+	}
+
+	// The cap never raises: an admin within a team granted only viewer still
+	// picks up viewer from the grant.
+	lowGrantTeam := seedTeamMember(t, ctx, orgA, cappedUser, "admin")
+	exec(t, ctx, `INSERT INTO workspace_team_access (id,workspace_id,team_id,role) VALUES ($1,$2,$3,'viewer')`, id(), wsID, lowGrantTeam)
+	if role, err = testQueries.GetWorkspaceTeamRole(ctx, wsID, cappedUser, orgA); err != nil || role != "viewer" {
+		t.Fatalf("admin in a viewer-granted team returned (%q, %v), want viewer", role, err)
+	}
+
+	// A second team grants more: the highest capped result wins, not the newest.
+	higherTeam := seedTeamMember(t, ctx, orgA, userA, "admin")
 	exec(t, ctx, `INSERT INTO workspace_team_access (id,workspace_id,team_id,role) VALUES ($1,$2,$3,'admin')`, id(), wsID, higherTeam)
 	if role, err = testQueries.GetWorkspaceTeamRole(ctx, wsID, userA, orgA); err != nil || role != "admin" {
 		t.Fatalf("two grants returned (%q, %v), want the higher one (admin)", role, err)
+	}
+
+	// A grant on one workspace is read only for that workspace.
+	otherWS := seedWorkspace(t, ctx, orgA, userA)
+	if role, err = testQueries.GetWorkspaceTeamRole(ctx, otherWS, userA, orgA); err != nil || role != "" {
+		t.Fatalf("grant leaked to another workspace: (%q, %v), want empty", role, err)
 	}
 
 	// A caller in another org reads no grant even with the exact workspace id.
@@ -412,5 +517,426 @@ func TestGetWorkspaceTeamRole(t *testing.T) {
 	// And a user who is in no granted team reads nothing either.
 	if role, err = testQueries.GetWorkspaceTeamRole(ctx, wsID, userB, orgA); err != nil || role != "" {
 		t.Fatalf("non-member read returned (%q, %v), want empty", role, err)
+	}
+}
+
+// ── workspace-scoped child lookups ──────────────────────────────────────────
+//
+// Every route under /workspaces/{workspaceID}/… is authorized against the
+// workspace in its path. These assert the queries behind those routes agree:
+// a child object addressed through the wrong workspace has to miss, so being
+// authorized on one workspace cannot be spent on another's variables, state, or
+// runs. Org scoping alone does not do it — both workspaces below are in the
+// same org, which is exactly the case the gate cannot see.
+
+func seedVariable(t *testing.T, ctx context.Context, wsID, orgID, key string) string {
+	t.Helper()
+	varID := id()
+	exec(t, ctx, `INSERT INTO workspace_variables (id,workspace_id,org_id,key,value,sensitive,category)
+		VALUES ($1,$2,$3,$4,'secret-value',true,'env')`, varID, wsID, orgID, key)
+	return varID
+}
+
+func seedStateVersion(t *testing.T, ctx context.Context, wsID, orgID, runID string, serial int) string {
+	t.Helper()
+	svID := id()
+	exec(t, ctx, `INSERT INTO state_versions (id,workspace_id,org_id,run_id,serial,state_url)
+		VALUES ($1,$2,$3,$4,$5,'s3://state/x.json')`, svID, wsID, orgID, runID, serial)
+	return svID
+}
+
+func TestWorkspaceVariableIsWorkspaceScoped(t *testing.T) {
+	requireDB(t)
+	ctx := context.Background()
+	orgID, userID := seedOrg(t, ctx, "varscope")
+	victim := seedWorkspace(t, ctx, orgID, userID)
+	attacker := seedWorkspace(t, ctx, orgID, userID)
+	varID := seedVariable(t, ctx, victim, orgID, "aws_secret_access_key")
+
+	// Reading through the owning workspace works.
+	if _, err := testQueries.GetWorkspaceVariable(ctx, repository.GetWorkspaceVariableParams{
+		ID: varID, WorkspaceID: victim, OrgID: orgID,
+	}); err != nil {
+		t.Fatalf("owning workspace should read its own variable, got: %v", err)
+	}
+
+	// Reading the same variable id through another workspace in the same org
+	// must miss — this is the read that returned a decrypted secret.
+	if _, err := testQueries.GetWorkspaceVariable(ctx, repository.GetWorkspaceVariableParams{
+		ID: varID, WorkspaceID: attacker, OrgID: orgID,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cross-workspace variable read must return no rows, got: %v", err)
+	}
+
+	// Writing through another workspace must change nothing.
+	if _, err := testQueries.UpdateWorkspaceVariable(ctx, repository.UpdateWorkspaceVariableParams{
+		ID: varID, WorkspaceID: attacker, OrgID: orgID, Value: "poisoned", Category: "env",
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cross-workspace variable update must affect no row, got: %v", err)
+	}
+	after, err := testQueries.GetWorkspaceVariable(ctx, repository.GetWorkspaceVariableParams{
+		ID: varID, WorkspaceID: victim, OrgID: orgID,
+	})
+	if err != nil {
+		t.Fatalf("re-read after blocked update: %v", err)
+	}
+	if after.Value != "secret-value" {
+		t.Fatalf("variable value = %q, want it untouched by the cross-workspace write", after.Value)
+	}
+
+	// Deleting through another workspace must miss and leave the row in place.
+	if _, err := testQueries.DeleteWorkspaceVariable(ctx, repository.DeleteWorkspaceVariableParams{
+		ID: varID, WorkspaceID: attacker, OrgID: orgID,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cross-workspace variable delete must affect no row, got: %v", err)
+	}
+	if _, err := testQueries.GetWorkspaceVariable(ctx, repository.GetWorkspaceVariableParams{
+		ID: varID, WorkspaceID: victim, OrgID: orgID,
+	}); err != nil {
+		t.Fatalf("variable should still exist after a blocked delete, got: %v", err)
+	}
+
+	// The legitimate delete still works.
+	if _, err := testQueries.DeleteWorkspaceVariable(ctx, repository.DeleteWorkspaceVariableParams{
+		ID: varID, WorkspaceID: victim, OrgID: orgID,
+	}); err != nil {
+		t.Fatalf("owning workspace should delete its own variable, got: %v", err)
+	}
+}
+
+func TestStateVersionIsWorkspaceScoped(t *testing.T) {
+	requireDB(t)
+	ctx := context.Background()
+	orgID, userID := seedOrg(t, ctx, "statescope")
+	victim := seedWorkspace(t, ctx, orgID, userID)
+	attacker := seedWorkspace(t, ctx, orgID, userID)
+	runID := seedRun(t, ctx, victim, orgID, userID)
+	svID := seedStateVersion(t, ctx, victim, orgID, runID, 1)
+
+	if _, err := testQueries.GetStateVersion(ctx, repository.GetStateVersionParams{
+		ID: svID, WorkspaceID: victim, OrgID: orgID,
+	}); err != nil {
+		t.Fatalf("owning workspace should read its own state version, got: %v", err)
+	}
+
+	// The download route resolves the blob's location from this row, so a hit
+	// here is a full tfstate — every provider credential in it — handed to a
+	// caller authorized on a different workspace.
+	if _, err := testQueries.GetStateVersion(ctx, repository.GetStateVersionParams{
+		ID: svID, WorkspaceID: attacker, OrgID: orgID,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cross-workspace state version read must return no rows, got: %v", err)
+	}
+}
+
+func TestRunLookupIsWorkspaceScoped(t *testing.T) {
+	requireDB(t)
+	ctx := context.Background()
+	orgID, userID := seedOrg(t, ctx, "runscope")
+	victim := seedWorkspace(t, ctx, orgID, userID)
+	attacker := seedWorkspace(t, ctx, orgID, userID)
+	runID := seedRun(t, ctx, victim, orgID, userID)
+
+	if _, err := testQueries.GetRunInWorkspace(ctx, repository.GetRunInWorkspaceParams{
+		ID: runID, WorkspaceID: victim, OrgID: orgID,
+	}); err != nil {
+		t.Fatalf("owning workspace should read its own run, got: %v", err)
+	}
+	if _, err := testQueries.GetRunInWorkspace(ctx, repository.GetRunInWorkspaceParams{
+		ID: runID, WorkspaceID: attacker, OrgID: orgID,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cross-workspace run read must return no rows, got: %v", err)
+	}
+
+	// Cancelling another workspace's in-flight run is a denial of service
+	// against whoever owns it.
+	if _, err := testQueries.CancelRun(ctx, runID, attacker, orgID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cross-workspace cancel must affect no row, got: %v", err)
+	}
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM runs WHERE id = $1`, runID).Scan(&status); err != nil {
+		t.Fatalf("read run status: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("run status = %q, want it untouched by the cross-workspace cancel", status)
+	}
+
+	// The legitimate cancel still works.
+	if _, err := testQueries.CancelRun(ctx, runID, victim, orgID); err != nil {
+		t.Fatalf("owning workspace should cancel its own run, got: %v", err)
+	}
+}
+
+// The grants panel names teams, so its join is org-scoped like the grant read
+// itself — a row planted against another org's team discloses nothing.
+func TestListWorkspaceTeamAccessIsOrgScoped(t *testing.T) {
+	requireDB(t)
+	ctx := context.Background()
+	orgA, userA := seedOrg(t, ctx, "wtaa")
+	orgB, userB := seedOrg(t, ctx, "wtab")
+	wsID := seedWorkspace(t, ctx, orgA, userA)
+
+	ownTeam := seedTeamMember(t, ctx, orgA, userA, "admin")
+	foreignTeam := seedTeamMember(t, ctx, orgB, userB, "admin")
+	exec(t, ctx, `INSERT INTO workspace_team_access (id,workspace_id,team_id,role) VALUES ($1,$2,$3,'operator')`, id(), wsID, ownTeam)
+	exec(t, ctx, `INSERT INTO workspace_team_access (id,workspace_id,team_id,role) VALUES ($1,$2,$3,'admin')`, id(), wsID, foreignTeam)
+
+	access, err := testQueries.ListWorkspaceTeamAccess(ctx, wsID, orgA)
+	if err != nil {
+		t.Fatalf("list workspace access: %v", err)
+	}
+	if len(access) != 1 {
+		t.Fatalf("got %d grants, want only the caller's own org's team", len(access))
+	}
+	if access[0].TeamID != ownTeam {
+		t.Fatalf("grant team = %q, want %q", access[0].TeamID, ownTeam)
+	}
+}
+
+// seedConfigWorkspace creates a workspace pinned to a specific repo URL,
+// working directory and approval gate — the three fields that decide whether
+// two workspaces are two doors onto the same infrastructure.
+func seedConfigWorkspace(t *testing.T, ctx context.Context, orgID, userID, repoURL, workingDir string, requiresApproval bool) string {
+	t.Helper()
+	wsID := id()
+	exec(t, ctx,
+		`INSERT INTO workspaces (id,org_id,name,created_by,repo_url,working_dir,requires_approval)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		wsID, orgID, "ws-"+wsID, userID, repoURL, workingDir, requiresApproval)
+	return wsID
+}
+
+// requires_approval protects the infrastructure a config manages, not the row
+// that names it: with terragrunt the backend is declared in the repo, so a
+// second workspace on the same repo + working_dir drives the same remote state.
+// HasGatedWorkspaceForConfig is what lets the handler refuse an ungated twin,
+// so it has to see through the ways the same target can be spelled.
+func TestHasGatedWorkspaceForConfig(t *testing.T) {
+	requireDB(t)
+	ctx := context.Background()
+	orgA, userA := seedOrg(t, ctx, "twin-a")
+	orgB, userB := seedOrg(t, ctx, "twin-b")
+
+	const repo = "https://github.com/acme/infra.git"
+	gated := seedConfigWorkspace(t, ctx, orgA, userA, repo, "envs/production", true)
+	seedConfigWorkspace(t, ctx, orgA, userA, repo, "envs/development", false)
+	// Same config, gated, but in another org — must never be visible here.
+	seedConfigWorkspace(t, ctx, orgB, userB, "https://github.com/acme/other", "envs/production", true)
+
+	tests := []struct {
+		name       string
+		orgID      string
+		repoURL    string
+		workingDir string
+		excludeID  string
+		want       bool
+	}{
+		{"exact match on a gated config", orgA, repo, "envs/production", "", true},
+		{"the same repo without the .git suffix", orgA, "https://github.com/acme/infra", "envs/production", "", true},
+		{"a trailing slash on the repo", orgA, "https://github.com/acme/infra.git/", "envs/production", "", true},
+		{"a different case on the host and path", orgA, "HTTPS://GitHub.com/Acme/Infra.GIT", "envs/production", "", true},
+		{"the same repo over ssh", orgA, "git@github.com:acme/infra.git", "envs/production", "", true},
+		{"the same repo with an embedded token", orgA, "https://ghp_token@github.com/acme/infra", "envs/production", "", true},
+		{"the same repo over the ssh:// scheme", orgA, "ssh://git@github.com/acme/infra", "envs/production", "", true},
+		{"the same repo on its scheme's default port", orgA, "https://github.com:443/acme/infra.git", "envs/production", "", true},
+		{"the same repo over ssh:// with an explicit port", orgA, "ssh://git@github.com:22/acme/infra", "envs/production", "", true},
+		// A git path is resolved as a path at the far end: every one of these
+		// clones the same tree — GitHub serves "acme//infra" and "acme/./infra"
+		// as "acme/infra" — so every one of them has to be the same row here.
+		{"a doubled slash inside the repo path", orgA, "https://github.com/acme//infra", "envs/production", "", true},
+		{"a . segment inside the repo path", orgA, "https://github.com/acme/./infra", "envs/production", "", true},
+		{"a trailing /. on the repo path", orgA, "https://github.com/acme/infra/.", "envs/production", "", true},
+		{"a trailing /. after the .git suffix", orgA, "https://github.com/acme/infra.git/.", "envs/production", "", true},
+		{"every repo respelling at once", orgA, "ssh://TOKEN@GitHub.com:22/acme//./infra.GIT//", "envs/production", "", true},
+		{"a ./ prefix on the working directory", orgA, repo, "./envs/production", "", true},
+		{"a trailing slash on the working directory", orgA, repo, "envs/production/", "", true},
+		// Every one of these is the same `cd` in the executor, so every one of
+		// them has to be the same row here — otherwise an ungated twin on gated
+		// infrastructure is one respelled path away.
+		{"a doubled slash inside the working directory", orgA, repo, "envs//production", "", true},
+		{"a . segment inside the working directory", orgA, repo, "envs/./production", "", true},
+		{"a trailing /. on the working directory", orgA, repo, "envs/production/.", "", true},
+		{"several of them at once", orgA, repo, "./envs//./production/.", "", true},
+
+		{"a different directory in the same repo", orgA, repo, "envs/staging", "", false},
+		{"the ungated sibling's own directory", orgA, repo, "envs/development", "", false},
+		{"a different repo entirely", orgA, "https://github.com/acme/apps", "envs/production", "", false},
+		// Folding spellings must not fold repos: a neighbouring name, a deeper
+		// path and another host all stay distinct, or the check refuses
+		// legitimate workspaces it has no business refusing.
+		{"a repo whose name starts the same", orgA, "https://github.com/acme/infra2", "envs/production", "", false},
+		{"a repo one level deeper", orgA, "https://github.com/acme/infra/sub", "envs/production", "", false},
+		{"the same path on another host", orgA, "https://gitlab.com/acme/infra", "envs/production", "", false},
+		{"an upload workspace has no repo to compare", orgA, "", "envs/production", "", false},
+
+		{"the gated workspace does not match itself", orgA, repo, "envs/production", gated, false},
+		{"another org's gated workspace is invisible", orgB, repo, "envs/production", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := testQueries.HasGatedWorkspaceForConfig(ctx, repository.GatedTwinParams{
+				OrgID:      tt.orgID,
+				RepoURL:    tt.repoURL,
+				WorkingDir: tt.workingDir,
+				ExcludeID:  tt.excludeID,
+			})
+			if err != nil {
+				t.Fatalf("HasGatedWorkspaceForConfig: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("HasGatedWorkspaceForConfig(repo=%q, dir=%q) = %v, want %v",
+					tt.repoURL, tt.workingDir, got, tt.want)
+			}
+		})
+	}
+
+	// The root of a repo has several spellings and they must all agree, so a
+	// gated workspace at "." cannot be twinned by one at "" or "./".
+	rootRepo := "https://github.com/acme/root-config"
+	seedConfigWorkspace(t, ctx, orgA, userA, rootRepo, ".", true)
+	for _, dir := range []string{".", "", "./", "/", "//", "/./", "./."} {
+		got, err := testQueries.HasGatedWorkspaceForConfig(ctx, repository.GatedTwinParams{
+			OrgID: orgA, RepoURL: rootRepo, WorkingDir: dir,
+		})
+		if err != nil {
+			t.Fatalf("HasGatedWorkspaceForConfig(root, %q): %v", dir, err)
+		}
+		if !got {
+			t.Errorf("working_dir %q did not match a gated workspace at the repo root", dir)
+		}
+	}
+
+	// The column is normalised too, not just the argument: a row written before
+	// the write boundary canonicalised working_dir still has to be found. Same
+	// for a stored repo URL that carries a port.
+	legacyRepo := "https://github.com:8443/acme/legacy.git"
+	seedConfigWorkspace(t, ctx, orgA, userA, legacyRepo, "envs//./production/", true)
+	got, err := testQueries.HasGatedWorkspaceForConfig(ctx, repository.GatedTwinParams{
+		OrgID: orgA, RepoURL: "https://github.com:8443/acme/legacy", WorkingDir: "envs/production",
+	})
+	if err != nil {
+		t.Fatalf("HasGatedWorkspaceForConfig(legacy): %v", err)
+	}
+	if !got {
+		t.Error("a canonically-spelled query missed a gated row stored with a respelled working_dir")
+	}
+
+	// Normalising the port must not collapse an scp-style remote whose owner is
+	// numeric — "git@github.com:2600/infra" is a repo, not a port.
+	seedConfigWorkspace(t, ctx, orgA, userA, "git@github.com:2600/infra.git", "envs/production", true)
+	got, err = testQueries.HasGatedWorkspaceForConfig(ctx, repository.GatedTwinParams{
+		OrgID: orgA, RepoURL: "https://github.com/infra", WorkingDir: "envs/production",
+	})
+	if err != nil {
+		t.Fatalf("HasGatedWorkspaceForConfig(scp numeric owner): %v", err)
+	}
+	if got {
+		t.Error("github.com/infra matched git@github.com:2600/infra — a numeric path segment was read as a port")
+	}
+}
+
+// A gated workspace guards the config it sits on, so the handler has to know
+// whether an update MOVES it — and "same config" has to mean here exactly what
+// it means to HasGatedWorkspaceForConfig. If a respelled save read as a move,
+// an operator would be refused an edit that opens nothing; if a real move read
+// as a stay, the last gate could walk off a configuration for free.
+func TestConfigTargetsMatch(t *testing.T) {
+	requireDB(t)
+	ctx := context.Background()
+
+	const repo = "https://github.com/acme/infra.git"
+	tests := []struct {
+		name                     string
+		repoA, dirA, repoB, dirB string
+		want                     bool
+	}{
+		{"identical spelling", repo, "envs/production", repo, "envs/production", true},
+
+		// Every spelling HasGatedWorkspaceForConfig collapses has to collapse
+		// here too, or the two checks disagree about the same pair of rows.
+		{"without the .git suffix", repo, "envs/production", "https://github.com/acme/infra", "envs/production", true},
+		{"trailing slash on the repo", repo, "envs/production", "https://github.com/acme/infra.git/", "envs/production", true},
+		{"different case", repo, "envs/production", "HTTPS://GitHub.com/Acme/Infra.GIT", "envs/production", true},
+		{"over ssh", repo, "envs/production", "git@github.com:acme/infra.git", "envs/production", true},
+		{"with an embedded token", repo, "envs/production", "https://ghp_token@github.com/acme/infra", "envs/production", true},
+		{"on the scheme's default port", repo, "envs/production", "https://github.com:443/acme/infra", "envs/production", true},
+		{"doubled slash in the repo path", repo, "envs/production", "https://github.com/acme//infra", "envs/production", true},
+		{"a . segment in the repo path", repo, "envs/production", "https://github.com/acme/./infra", "envs/production", true},
+		{"trailing /. after the .git suffix", repo, "envs/production", "https://github.com/acme/infra.git/.", "envs/production", true},
+		{"./ prefix on the directory", repo, "envs/production", repo, "./envs/production", true},
+		{"doubled slash in the directory", repo, "envs/production", repo, "envs//production", true},
+		{"every spelling of the repo root", repo, ".", repo, "", true},
+		{"another spelling of the repo root", repo, "/", repo, "./.", true},
+
+		// Real moves.
+		{"a different directory", repo, "envs/production", repo, "envs/production-old", false},
+		{"a different repo", repo, "envs/production", "https://github.com/acme/apps", "envs/production", false},
+		{"a numeric scp owner is not a port", "git@github.com:2600/infra.git", ".", "https://github.com/infra", ".", false},
+
+		// An upload workspace has no config identity, so it matches nothing —
+		// not even another upload. Same reading the twin check takes.
+		{"upload on the left", "", "envs/production", repo, "envs/production", false},
+		{"upload on the right", repo, "envs/production", "", "envs/production", false},
+		{"upload on both sides", "", "envs/production", "", "envs/production", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := testQueries.ConfigTargetsMatch(ctx, repository.ConfigTargetsMatchParams{
+				RepoURLA: tt.repoA, WorkingDirA: tt.dirA,
+				RepoURLB: tt.repoB, WorkingDirB: tt.dirB,
+			})
+			if err != nil {
+				t.Fatalf("ConfigTargetsMatch: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ConfigTargetsMatch(%q %q, %q %q) = %v, want %v",
+					tt.repoA, tt.dirA, tt.repoB, tt.dirB, got, tt.want)
+			}
+		})
+	}
+
+	// The two checks have to agree row for row: whatever ConfigTargetsMatch
+	// calls the same config, HasGatedWorkspaceForConfig has to find, and
+	// whatever it calls a move must leave the origin visible as gated when the
+	// mover is excluded.
+	orgA, userA := seedOrg(t, ctx, "origin-a")
+	gated := seedConfigWorkspace(t, ctx, orgA, userA, repo, "envs/production", true)
+
+	same, err := testQueries.ConfigTargetsMatch(ctx, repository.ConfigTargetsMatchParams{
+		RepoURLA: repo, WorkingDirA: "envs/production",
+		RepoURLB: "https://github.com/acme/infra/", WorkingDirB: "./envs/production",
+	})
+	if err != nil {
+		t.Fatalf("ConfigTargetsMatch: %v", err)
+	}
+	if !same {
+		t.Fatal("a respelled resubmit of the same target must not read as a move")
+	}
+
+	// Excluding the only gate leaves the config unguarded — the state the
+	// handler refuses to create at the operator bar.
+	stillGated, err := testQueries.HasGatedWorkspaceForConfig(ctx, repository.GatedTwinParams{
+		OrgID: orgA, RepoURL: repo, WorkingDir: "envs/production", ExcludeID: gated,
+	})
+	if err != nil {
+		t.Fatalf("HasGatedWorkspaceForConfig: %v", err)
+	}
+	if stillGated {
+		t.Fatal("nothing else gates envs/production; excluding the mover must report it unguarded")
+	}
+
+	// Stand a second gate on the same config and the move is free again, which
+	// is the escape hatch the 403 names.
+	seedConfigWorkspace(t, ctx, orgA, userA, "https://github.com/acme/infra", "./envs/production", true)
+	stillGated, err = testQueries.HasGatedWorkspaceForConfig(ctx, repository.GatedTwinParams{
+		OrgID: orgA, RepoURL: repo, WorkingDir: "envs/production", ExcludeID: gated,
+	})
+	if err != nil {
+		t.Fatalf("HasGatedWorkspaceForConfig: %v", err)
+	}
+	if !stillGated {
+		t.Fatal("a replacement gate spelled differently must still count as guarding the config")
 	}
 }

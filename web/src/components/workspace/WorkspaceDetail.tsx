@@ -21,6 +21,8 @@ import { formatRelativeTime, formatDuration, getEnvironmentColor } from '@/lib/u
 import { navigate } from '@/hooks/useNavigate';
 import { Link } from '@/components/ui/link';
 import { ConfigUpload } from '@/components/workspace/ConfigUpload';
+import { roleAtLeast } from '@/lib/roles';
+import { useAuth } from '@/hooks/useAuth';
 import {
   Dialog,
   DialogContent,
@@ -68,6 +70,7 @@ function getTabFromURL(): Tab {
 
 export function WorkspaceDetail({ workspaceId }: Props) {
   const uid = useId();
+  const { user } = useAuth();
   const queryClient = useQueryClient();
   const confirm = useConfirm();
   const [tab, setTab] = useState<Tab>(getTabFromURL);
@@ -143,7 +146,7 @@ export function WorkspaceDetail({ workspaceId }: Props) {
       setImportRows([{ address: '', id: '' }]);
       navigate(`/workspaces/${workspaceId}/runs/${run.id}`);
     },
-    onError: () => toast.error('Failed to create run'),
+    onError: (e) => toast.error((e as { message?: string })?.message ?? 'Failed to create run'),
   });
 
   const lockMutation = useMutation({
@@ -180,9 +183,15 @@ export function WorkspaceDetail({ workspaceId }: Props) {
   const [cloneName, setCloneName] = useState('');
   const [cloneDescription, setCloneDescription] = useState('');
   const [cloneEnvironment, setCloneEnvironment] = useState('');
+  const [cloneRequiresApproval, setCloneRequiresApproval] = useState(false);
 
   const cloneMutation = useMutation({
-    mutationFn: async (body: { name: string; description?: string; environment?: string }) => {
+    mutationFn: async (body: {
+      name: string;
+      description?: string;
+      environment?: string;
+      requires_approval?: boolean;
+    }) => {
       const { data, error } = await api.POST('/workspaces/{workspaceId}/clone', {
         params: { path: { workspaceId } },
         body,
@@ -194,13 +203,19 @@ export function WorkspaceDetail({ workspaceId }: Props) {
       toast.success('Workspace cloned successfully');
       window.location.href = `/workspaces/${ws.id}`;
     },
-    onError: () => toast.error('Failed to clone workspace'),
+    // Carry the server's message. A clone can be refused for a reason the
+    // caller can act on — another workspace already gates this repo and
+    // directory, so this one has to carry the gate too — and a generic failure
+    // toast would hide the one instruction that clears it.
+    onError: (e) =>
+      toast.error((e as { message?: string })?.message ?? 'Failed to clone workspace'),
   });
 
   const openCloneDialog = () => {
     setCloneName('');
     setCloneDescription(workspace?.description ?? '');
     setCloneEnvironment(workspace?.environment ?? 'development');
+    setCloneRequiresApproval(workspace?.requires_approval ?? false);
     setShowCloneDialog(true);
   };
 
@@ -210,6 +225,7 @@ export function WorkspaceDetail({ workspaceId }: Props) {
       name: cloneName.trim(),
       description: cloneDescription,
       environment: cloneEnvironment,
+      requires_approval: cloneRequiresApproval,
     });
   };
 
@@ -230,6 +246,22 @@ export function WorkspaceDetail({ workspaceId }: Props) {
       </div>
     );
   }
+
+  // Releasing a gated workspace is org-level authority: handler/run.go checks
+  // the ORG role there, because a per-workspace grant does not carry the right
+  // to sign off a gated apply. Everything else on this page is authorized
+  // against the workspace-effective role — the higher of the caller's org role
+  // and a grant one of their teams holds here — which is what the API puts in
+  // workspace.effective_role. These only decide what the page offers; the API
+  // decides the request.
+  const canReleaseGate = roleAtLeast(user?.role, 'admin');
+  const effectiveRole = workspace.effective_role ?? user?.role;
+  const canRun = roleAtLeast(effectiveRole, 'operator');
+  const canManageState = roleAtLeast(effectiveRole, 'admin');
+  // On a workspace that requires approval, a smoke test is not a dry run: it
+  // shell-executes a script from the repo with the run's credentials, so it
+  // carries the same bar as releasing the gate.
+  const gatedForCaller = workspace.requires_approval && !canReleaseGate;
 
   const tabs: { id: Tab; label: string; icon: typeof ListOrdered }[] = [
     { id: 'runs', label: 'Runs', icon: ListOrdered },
@@ -318,9 +350,14 @@ export function WorkspaceDetail({ workspaceId }: Props) {
               disabled={
                 createRunMutation.isPending ||
                 workspace.locked ||
+                gatedForCaller ||
                 (workspace.source === 'upload' && !workspace.current_config_version_id)
               }
-              title="Run smoke-test.sh from the working directory"
+              title={
+                gatedForCaller
+                  ? 'This workspace requires approval, and a smoke test runs a script from the repo with the workspace credentials — admins run it'
+                  : 'Run smoke-test.sh from the working directory'
+              }
             >
               <FlaskConical className="w-4 h-4" />
               Test
@@ -331,7 +368,16 @@ export function WorkspaceDetail({ workspaceId }: Props) {
               disabled={
                 createRunMutation.isPending ||
                 workspace.locked ||
+                !canManageState ||
+                gatedForCaller ||
                 (workspace.source === 'upload' && !workspace.current_config_version_id)
+              }
+              title={
+                gatedForCaller
+                  ? 'This workspace requires approval — every state-changing run on it, import included, is an admin action'
+                  : canManageState
+                    ? 'Adopt existing resources into this workspace state'
+                    : 'Import rewrites the workspace state — admins run it'
               }
             >
               <Import className="w-4 h-4" />
@@ -353,12 +399,59 @@ export function WorkspaceDetail({ workspaceId }: Props) {
               disabled={
                 createRunMutation.isPending ||
                 workspace.locked ||
+                !canManageState ||
+                gatedForCaller ||
                 (workspace.source === 'upload' && !workspace.current_config_version_id)
+              }
+              title={
+                gatedForCaller
+                  ? 'This workspace requires approval — every state-changing run on it, destroy included, is an admin action'
+                  : canManageState
+                    ? 'Destroy every resource this workspace manages'
+                    : 'Destroying live resources is an admin action'
               }
             >
               <Trash2 className="w-4 h-4" />
               Destroy
             </Button>
+            {/* Apply is the operator's half of the workflow: rbac.go puts
+                ActionApplyRun at operator, and handler/run.go only raises the
+                bar on a workspace that requires approval — where the run parks
+                for an admin to sign instead. Without this control the only
+                apply an operator could reach was auto_apply, which is admin to
+                turn on, so the plan they can start had nowhere to go. */}
+            {canRun && (
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  if (
+                    await confirm({
+                      title: 'Apply this workspace?',
+                      message:
+                        'This runs OpenTofu against live infrastructure now. It plans and applies in one run — there is no separate plan to review first.',
+                      confirmLabel: 'Apply',
+                      destructive: false,
+                    })
+                  ) {
+                    createRunMutation.mutate({ operation: 'apply' });
+                  }
+                }}
+                disabled={
+                  createRunMutation.isPending ||
+                  workspace.locked ||
+                  gatedForCaller ||
+                  (workspace.source === 'upload' && !workspace.current_config_version_id)
+                }
+                title={
+                  gatedForCaller
+                    ? 'This workspace requires approval: start a plan and have an admin approve it'
+                    : 'Plan and apply this workspace against live infrastructure'
+                }
+              >
+                <Play className="w-4 h-4" />
+                Apply
+              </Button>
+            )}
             <Button
               onClick={() => createRunMutation.mutate({ operation: 'plan' })}
               disabled={
@@ -656,6 +749,26 @@ export function WorkspaceDetail({ workspaceId }: Props) {
                   <option value="production">production</option>
                 </Select>
               </div>
+              {/* The clone lands on the source's repo and working directory, so
+                  it is a second door onto the same infrastructure. If anything
+                  else already gates that config the API refuses an ungated
+                  clone — this is how the clone carries the gate instead of
+                  needing an admin. Clearing a gate the source holds is still an
+                  admin move and the API says so. */}
+              <label className="flex items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={cloneRequiresApproval}
+                  onChange={(e) => setCloneRequiresApproval(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  Require approval
+                  <span className="block text-xs text-muted-foreground">
+                    Applies on the clone park for an admin to sign off.
+                  </span>
+                </span>
+              </label>
               <div className="flex justify-end gap-2 pt-2">
                 <Button variant="outline" onClick={() => setShowCloneDialog(false)}>
                   Cancel

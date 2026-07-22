@@ -138,9 +138,12 @@ func (h *RunHandler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *RunHandler) Get(w http.ResponseWriter, r *http.Request) {
 	userCtx := auth.GetUser(r.Context())
+	workspaceID := chi.URLParam(r, "workspaceID")
 	runID := chi.URLParam(r, "runID")
 
-	run, err := h.svc.Get(r.Context(), runID, userCtx.OrgID)
+	// Keyed on the workspace this request was authorized against — a run id
+	// from another workspace is not found.
+	run, err := h.svc.Get(r.Context(), runID, workspaceID, userCtx.OrgID)
 	if err != nil {
 		respond.FromError(w, r, err)
 		return
@@ -187,7 +190,6 @@ func (h *RunHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if workspace is locked
 	ws, err := h.workspaceSvc.Get(r.Context(), workspaceID, userCtx.OrgID)
 	if err != nil {
 		respond.FromError(w, r, err)
@@ -195,6 +197,29 @@ func (h *RunHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if ws.Locked {
 		respond.Error(w, http.StatusConflict, "workspace is locked")
+		return
+	}
+
+	// A workspace with requires_approval says nothing on it touches live
+	// infrastructure or state without a human signing off. Every operation that
+	// can do either — apply, destroy, test (it shell-executes smoke-test.sh from
+	// the repo) and import (it rewrites state) — reaches that outcome with no
+	// approval row ever created, so on a gated workspace they carry the bar that
+	// signing the approval carries: ActionApplyProd, org-scoped, exactly like
+	// POST .../approvals.
+	//
+	// It is the org role that is checked, not the workspace-resolved one: a
+	// per-workspace grant does not confer the authority to release a gated
+	// apply, the same rule the approval route and the settings guard follow.
+	//
+	// What an operator keeps on a gated workspace is the plan: they can start
+	// one, and it parks at awaiting_approval for an admin to sign — signing is
+	// ActionApplyProd at POST .../approvals, which an operator does not clear.
+	// On an ungated workspace nothing here fires and their org role decides, so
+	// apply stays theirs.
+	if requiresApprovalGate(ws, req.Operation) && !auth.CanPerform(userCtx.Role, auth.ActionApplyProd) {
+		respond.Error(w, http.StatusForbidden,
+			"this workspace requires approval: run a plan and have it approved, or hold admin role or higher")
 		return
 	}
 
@@ -226,6 +251,39 @@ func (h *RunHandler) Create(w http.ResponseWriter, r *http.Request) {
 	respond.JSON(w, http.StatusCreated, runResponse(run))
 }
 
+// requiresApprovalGate reports whether this operation on this workspace can
+// change live infrastructure or its state without an approval row, on a
+// workspace whose whole point is that neither happens unsigned.
+//
+// apply and destroy are the obvious ones: they run tofu against live state.
+//
+// test is not a dry run. It runs `/bin/sh smoke-test.sh` from the checked-out
+// working directory (executor/local.go and the generated script in
+// executor/kubernetes.go), with the run's full environment — every decrypted
+// env-category variable and the executor's own cloud identity. The file comes
+// from the repo the workspace points at, and repointing a workspace sits at the
+// route's operator bar, so an ungated test is a way to run anything the
+// workspace can run. The worker agrees: it records a finished test as
+// "applied".
+//
+// import writes a new state version. Rewriting which real resources a config
+// claims is what ActionManageState guards everywhere else.
+//
+// plan is the one operation left out, and deliberately: it is how an operator
+// reaches the approval in the first place, so gating it would leave gated
+// workspaces with no operator workflow at all.
+func requiresApprovalGate(ws repository.Workspace, operation string) bool {
+	if !ws.RequiresApproval {
+		return false
+	}
+	switch operation {
+	case "apply", "destroy", "test", "import":
+		return true
+	default: // plan
+		return false
+	}
+}
+
 // isValidOperation returns whether an operation string is valid.
 func isValidOperation(op string) bool {
 	switch op {
@@ -251,9 +309,10 @@ func isCancellableStatus(status string) bool {
 
 func (h *RunHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 	userCtx := auth.GetUser(r.Context())
+	workspaceID := chi.URLParam(r, "workspaceID")
 	runID := chi.URLParam(r, "runID")
 
-	cancelled, err := h.svc.Cancel(r.Context(), runID, userCtx.OrgID)
+	cancelled, err := h.svc.Cancel(r.Context(), runID, workspaceID, userCtx.OrgID)
 	if err != nil {
 		// CancelRun returns ErrNoRows if the run doesn't exist or isn't in a cancellable state
 		respond.Error(w, http.StatusConflict, "run not found or cannot be cancelled in its current state")
@@ -272,9 +331,10 @@ func (h *RunHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 
 func (h *RunHandler) GetPlanJSON(w http.ResponseWriter, r *http.Request) {
 	userCtx := auth.GetUser(r.Context())
+	workspaceID := chi.URLParam(r, "workspaceID")
 	runID := chi.URLParam(r, "runID")
 
-	run, err := h.svc.Get(r.Context(), runID, userCtx.OrgID)
+	run, err := h.svc.Get(r.Context(), runID, workspaceID, userCtx.OrgID)
 	if err != nil {
 		respond.FromError(w, r, err)
 		return
@@ -302,16 +362,18 @@ func (h *RunHandler) GetPlanJSON(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *RunHandler) StreamLogs(w http.ResponseWriter, r *http.Request) {
+	workspaceID := chi.URLParam(r, "workspaceID")
 	runID := chi.URLParam(r, "runID")
 
-	// Org-scope before upgrading: the run must belong to the caller's org, or
-	// any authenticated user could stream any run's live logs by guessing a ULID.
+	// Scope before upgrading: the run must belong to the workspace this request
+	// was authorized against, or a caller could stream another workspace's live
+	// logs through a workspace they do hold.
 	userCtx := auth.GetUser(r.Context())
 	if userCtx == nil {
 		respond.Error(w, http.StatusUnauthorized, "not authenticated")
 		return
 	}
-	if _, err := h.svc.Get(r.Context(), runID, userCtx.OrgID); err != nil {
+	if _, err := h.svc.Get(r.Context(), runID, workspaceID, userCtx.OrgID); err != nil {
 		respond.FromError(w, r, err)
 		return
 	}

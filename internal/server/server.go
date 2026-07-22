@@ -23,7 +23,27 @@ import (
 	"github.com/nanohype/portal/internal/tracing"
 )
 
+// Option configures a Server before its router is built.
+type Option func(*Server)
+
+// WithAuthzResolver replaces the source the gates read authorization from — the
+// caller's current org role and their teams' grants on a workspace. Production
+// passes service.AuthzService, which reads both from Postgres. Tests pass a
+// resolver they control, so the authorization behaviour of the real router can
+// be asserted without a database standing in the way.
+func WithAuthzResolver(resolver AuthzResolver) Option {
+	return func(s *Server) { s.authz = resolver }
+}
+
+// AuthzResolver is everything the gates need to decide a request: who the
+// caller is right now, and what their teams hold on one workspace.
+type AuthzResolver interface {
+	auth.UserRoleResolver
+	auth.WorkspaceRoleResolver
+}
+
 type Server struct {
+	authz           AuthzResolver
 	cfg             *config.Config
 	router          chi.Router
 	db              *pgxpool.Pool
@@ -38,11 +58,14 @@ type Server struct {
 	clusterOrderSvc *service.ClusterOrderService
 }
 
-func New(cfg *config.Config, db *pgxpool.Pool, logger *slog.Logger) *Server {
+func New(cfg *config.Config, db *pgxpool.Pool, logger *slog.Logger, opts ...Option) *Server {
 	s := &Server{
 		cfg:    cfg,
 		db:     db,
 		logger: logger,
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 
 	s.setupRouter()
@@ -130,7 +153,16 @@ func (s *Server) setupRouter() {
 		streamer = logstream.NewMemoryStreamer()
 	}
 	jwtAuth := auth.NewJWTAuth(s.cfg.JWTSecret, s.cfg.JWTExpiration)
-	authMiddleware := auth.NewMiddleware(jwtAuth)
+
+	// One authorization source for the whole router: the authentication
+	// middleware reads the caller's org role from it on every request, and every
+	// workspace gate reads their team grants from it. Sharing one resolver is
+	// what keeps a single request from being decided against two different
+	// pictures of who the caller is.
+	if s.authz == nil {
+		s.authz = service.NewAuthzService(queries)
+	}
+	authMiddleware := auth.NewMiddleware(jwtAuth, s.authz)
 
 	// Optional S3 storage
 	var store *storage.S3Storage
@@ -177,7 +209,7 @@ func (s *Server) setupRouter() {
 	}
 	runHandler := handler.NewRunHandler(s.runSvc, workspaceSvc, streamer, auditSvc, wsOrigins, store)
 	discoverySvc := service.NewDiscoveryService(queries, store)
-	variableHandler := handler.NewVariableHandler(queries, encryptor, auditSvc, workspaceSvc, discoverySvc)
+	variableHandler := handler.NewVariableHandler(queries, encryptor, auditSvc, workspaceSvc, discoverySvc, s.authz)
 	teamSvc := service.NewTeamService(queries)
 	teamHandler := handler.NewTeamHandler(teamSvc, auditSvc)
 	stateSvc := service.NewStateService(queries, store)
@@ -204,12 +236,13 @@ func (s *Server) setupRouter() {
 	// URL, so an admin can hand one team elevated rights on one workspace
 	// without moving anybody's org role. Grants only ever elevate — see
 	// auth.RequireWorkspaceRole.
-	wsView := auth.RequireWorkspaceAction(teamSvc, auth.ActionViewWorkspace)
-	wsRun := auth.RequireWorkspaceAction(teamSvc, auth.ActionCreateRun)
-	wsVars := auth.RequireWorkspaceAction(teamSvc, auth.ActionManageVars)
-	wsState := auth.RequireWorkspaceAction(teamSvc, auth.ActionManageState)
-	wsDelete := auth.RequireWorkspaceAction(teamSvc, auth.ActionDeleteWorkspace)
-	wsOperator := auth.RequireWorkspaceRole(teamSvc, "operator")
+	wsView := auth.RequireWorkspaceAction(s.authz, auth.ActionViewWorkspace)
+	wsRun := auth.RequireWorkspaceAction(s.authz, auth.ActionCreateRun)
+	wsVars := auth.RequireWorkspaceAction(s.authz, auth.ActionManageVars)
+	wsReveal := auth.RequireWorkspaceAction(s.authz, auth.ActionRevealSecret)
+	wsState := auth.RequireWorkspaceAction(s.authz, auth.ActionManageState)
+	wsDelete := auth.RequireWorkspaceAction(s.authz, auth.ActionDeleteWorkspace)
+	wsOperator := auth.RequireWorkspaceRole(s.authz, "operator")
 
 	// API routes
 	r.Route("/api/v1", func(r chi.Router) {
@@ -262,7 +295,7 @@ func (s *Server) setupRouter() {
 					r.Route("/{variableID}", func(r chi.Router) {
 						r.With(auth.RequireAction(auth.ActionManageVars)).Put("/", orgVarHandler.Update)
 						r.With(auth.RequireAction(auth.ActionManageVars)).Delete("/", orgVarHandler.Delete)
-						r.With(auth.RequireRole("operator")).Get("/value", orgVarHandler.RevealValue)
+						r.With(auth.RequireAction(auth.ActionRevealSecret)).Get("/value", orgVarHandler.RevealValue)
 					})
 				})
 
@@ -387,11 +420,11 @@ func (s *Server) setupRouter() {
 						// Pipeline variables
 						r.Route("/variables", func(r chi.Router) {
 							r.Get("/", pipelineVarHandler.List)
-							r.With(auth.RequireRole("operator")).Post("/", pipelineVarHandler.Create)
+							r.With(auth.RequireAction(auth.ActionManageVars)).Post("/", pipelineVarHandler.Create)
 							r.Route("/{variableID}", func(r chi.Router) {
-								r.With(auth.RequireRole("operator")).Put("/", pipelineVarHandler.Update)
-								r.With(auth.RequireRole("operator")).Delete("/", pipelineVarHandler.Delete)
-								r.With(auth.RequireRole("operator")).Get("/value", pipelineVarHandler.RevealValue)
+								r.With(auth.RequireAction(auth.ActionManageVars)).Put("/", pipelineVarHandler.Update)
+								r.With(auth.RequireAction(auth.ActionManageVars)).Delete("/", pipelineVarHandler.Delete)
+								r.With(auth.RequireAction(auth.ActionRevealSecret)).Get("/value", pipelineVarHandler.RevealValue)
 							})
 						})
 					})
@@ -411,8 +444,19 @@ func (s *Server) setupRouter() {
 						// Settings drive what the worker checks out and runs.
 						// The two fields that decide whether an apply needs a
 						// human — auto_apply and requires_approval — are held
-						// to the org-level approval bar inside the handler.
+						// to the org-level approval bar inside the handler, and
+						// so is repointing the last gated workspace off a
+						// configuration, which leaves that configuration open
+						// to an ungated one just as surely.
 						r.With(wsOperator).Put("/", workspaceHandler.Update)
+						// Deleting the last workspace requiring approval on a
+						// configuration leaves that configuration open to an
+						// ungated one, exactly as repointing it away does, so
+						// the handler holds that case at the same org-level
+						// approval bar. The route itself is workspace scoped,
+						// which is what makes the difference matter: an admin
+						// grant on one workspace clears this gate, and it must
+						// not also retire a production approval.
 						r.With(wsDelete).Delete("/", workspaceHandler.Delete)
 						r.With(wsOperator).Post("/lock", workspaceHandler.Lock)
 						r.With(wsOperator).Post("/unlock", workspaceHandler.Unlock)
@@ -426,14 +470,24 @@ func (s *Server) setupRouter() {
 							r.With(wsView).Get("/", variableHandler.List)
 							r.With(wsView).Get("/effective", variableHandler.Effective)
 							r.With(wsVars).Post("/", variableHandler.Create)
-							r.With(wsVars).Post("/discover", variableHandler.Discover)
+							// Discover parses the workspace's own config and returns
+							// the variable names it declares. Nothing is written, and
+							// below ActionManageVars nothing is valued either — the
+							// handler strips the value column and skips the terragrunt
+							// render that would resolve it. That leaves a read of the
+							// config's shape, which is what the read bar is for: same
+							// split the state routes below make, where the resource
+							// inventory is readable and the attribute values are not.
+							// It is a POST only because acquiring the config is the
+							// expensive part.
+							r.With(wsView).Post("/discover", variableHandler.Discover)
 							r.With(wsVars).Post("/bulk", variableHandler.BulkCreate)
 							r.With(wsVars).Post("/import-outputs", variableHandler.ImportOutputs)
 							r.With(wsVars).Post("/copy", variableHandler.CopyVariables)
 							r.Route("/{variableID}", func(r chi.Router) {
 								r.With(wsVars).Put("/", variableHandler.Update)
 								r.With(wsVars).Delete("/", variableHandler.Delete)
-								r.With(wsOperator).Get("/value", variableHandler.RevealValue)
+								r.With(wsReveal).Get("/value", variableHandler.RevealValue)
 							})
 						})
 
@@ -441,6 +495,16 @@ func (s *Server) setupRouter() {
 						// Outputs tabs; the raw download hands over the whole
 						// tfstate file, every provider credential in it
 						// included, so it sits with state management.
+						//
+						// The parsed views are on the read bar for the
+						// INVENTORY only — addresses, providers, serials,
+						// which attributes changed. Attribute values are the
+						// same bytes the download refuses to hand over at this
+						// tier (tofu writes random_password.result and
+						// tls_private_key.private_key_pem into state in
+						// cleartext), so handler.attributeView withholds them
+						// below ActionManageState and the two routes disclose
+						// the same material at the same bar.
 						r.Route("/state", func(r chi.Router) {
 							r.With(wsView).Get("/", stateHandler.List)
 							r.With(wsView).Get("/current", stateHandler.GetCurrent)

@@ -209,7 +209,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Reveal an org variable's decrypted value (operator) */
+        /** Reveal an org variable's decrypted value (admin) */
         get: operations["revealOrgVariableValue"];
         put?: never;
         post?: never;
@@ -650,7 +650,7 @@ export interface paths {
         /** List pipelines */
         get: operations["listPipelines"];
         put?: never;
-        /** Create a pipeline (operator) */
+        /** Create a pipeline (operator; a stage auto_apply on a gated workspace needs admin) */
         post: operations["createPipeline"];
         delete?: never;
         options?: never;
@@ -667,7 +667,7 @@ export interface paths {
         };
         /** Get a pipeline with its stages */
         get: operations["getPipeline"];
-        /** Update a pipeline (operator) */
+        /** Update a pipeline (operator; a stage auto_apply on a gated workspace needs admin) */
         put: operations["updatePipeline"];
         post?: never;
         /** Delete a pipeline (admin) */
@@ -739,7 +739,7 @@ export interface paths {
         /** List pipeline variables */
         get: operations["listPipelineVariables"];
         put?: never;
-        /** Create a pipeline variable (operator) */
+        /** Create a pipeline variable (admin) */
         post: operations["createPipelineVariable"];
         delete?: never;
         options?: never;
@@ -755,10 +755,10 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Update a pipeline variable (operator) */
+        /** Update a pipeline variable (admin) */
         put: operations["updatePipelineVariable"];
         post?: never;
-        /** Delete a pipeline variable (operator) */
+        /** Delete a pipeline variable (admin) */
         delete: operations["deletePipelineVariable"];
         options?: never;
         head?: never;
@@ -772,7 +772,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Reveal a pipeline variable's decrypted value (operator) */
+        /** Reveal a pipeline variable's decrypted value (admin) */
         get: operations["revealPipelineVariableValue"];
         put?: never;
         post?: never;
@@ -792,7 +792,7 @@ export interface paths {
         /** List workspaces */
         get: operations["listWorkspaces"];
         put?: never;
-        /** Create a workspace (operator) */
+        /** Create a workspace (operator; auto_apply needs admin) */
         post: operations["createWorkspace"];
         delete?: never;
         options?: never;
@@ -809,10 +809,10 @@ export interface paths {
         };
         /** Get a workspace */
         get: operations["getWorkspace"];
-        /** Update a workspace (operator; auto_apply and requires_approval need admin) */
+        /** Update a workspace (operator; turning auto_apply on or requires_approval off needs admin) */
         put: operations["updateWorkspace"];
         post?: never;
-        /** Delete a workspace (admin) */
+        /** Delete a workspace (admin on the workspace; deleting the last workspace requiring approval on a repository + working directory needs org admin) */
         delete: operations["deleteWorkspace"];
         options?: never;
         head?: never;
@@ -848,7 +848,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Clone a workspace with its variables (operator) */
+        /** Clone a workspace with its variables (operator; an auto-applying source needs admin) */
         post: operations["cloneWorkspace"];
         delete?: never;
         options?: never;
@@ -935,8 +935,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Discover the config's variable surface (admin)
-         * @description Parses the staged config (terragrunt render + variables.tf, or plain tofu) and returns every module variable with its configured state. Synchronous; intentionally not list-enveloped.
+         * Discover the config's variable surface (viewer)
+         * @description Parses the staged config (terragrunt render + variables.tf, or plain tofu) and returns every module variable with its configured state. The `default` field carries the value the config resolves — a terragrunt input or a module default — so it is only populated for callers who clear the variable-management bar (admin, or an admin team grant on this workspace). Below that bar the response is names, types, descriptions and provenance with no values, and the terragrunt render that would resolve them is skipped. Synchronous; intentionally not list-enveloped.
          */
         post: operations["discoverWorkspaceVariables"];
         delete?: never;
@@ -971,7 +971,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Import another workspace's outputs as variables (admin) */
+        /**
+         * Import another workspace's outputs as variables (admin on both workspaces)
+         * @description Upserts each of the source workspace's state outputs as a terraform-category variable on this one. Outputs the source state marks sensitive are skipped: state redacts their values, so there is nothing to carry across. A source whose outputs are all sensitive answers 400 saying so.
+         */
         post: operations["importWorkspaceOutputs"];
         delete?: never;
         options?: never;
@@ -988,7 +991,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Copy another workspace's variables into this one (admin) */
+        /** Copy another workspace's variables into this one (admin on both workspaces) */
         post: operations["copyWorkspaceVariables"];
         delete?: never;
         options?: never;
@@ -1021,7 +1024,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Reveal a workspace variable's decrypted value (operator) */
+        /** Reveal a workspace variable's decrypted value (admin) */
         get: operations["revealWorkspaceVariableValue"];
         put?: never;
         post?: never;
@@ -1212,7 +1215,7 @@ export interface paths {
         /** List a workspace's runs */
         get: operations["listRuns"];
         put?: never;
-        /** Create a run (role elevates per operation) */
+        /** Create a run (role elevates per operation; apply/destroy on a workspace that requires approval needs admin) */
         post: operations["createRun"];
         delete?: never;
         options?: never;
@@ -1399,6 +1402,7 @@ export interface components {
             source?: "vcs" | "upload";
             repo_url?: string;
             repo_branch?: string;
+            /** @description Repo-relative path to the leaf portal runs in. Stored canonical: "./envs/production", "envs//production", "envs/./production" and "envs/production/" all name one directory to the executor, so they are all stored as "envs/production". Omit on update to keep the stored value. */
             working_dir?: string;
             tofu_version?: string;
             /** @enum {string} */
@@ -1412,6 +1416,7 @@ export interface components {
             description?: string;
             repo_url?: string;
             repo_branch?: string;
+            /** @description Repo-relative path to the leaf portal runs in. Stored canonical: "./envs/production", "envs//production", "envs/./production" and "envs/production/" all name one directory to the executor, so they are all stored as "envs/production". Omit on update to keep the stored value. */
             working_dir?: string;
             tofu_version?: string;
             /** @enum {string} */
@@ -1424,6 +1429,8 @@ export interface components {
             name: string;
             description?: string;
             environment?: string;
+            /** @description Approval gate for the clone. Omit to inherit the source's. Raising it is an operator action — it is how a clone of a config another workspace already gates gets created without an admin. Clearing a gate the source holds needs admin. */
+            requires_approval?: boolean;
         };
         /** @enum {string} */
         RunStatus: "pending" | "queued" | "planning" | "planned" | "awaiting_approval" | "applying" | "applied" | "errored" | "cancelled" | "discarded";
@@ -1500,9 +1507,12 @@ export interface components {
             module: string;
             provider: string;
             mode: string;
+            /** @description Attribute names the instance carries. Values are present only for callers who may manage this workspace's state; below that bar every value is null and attributes_redacted is true, because tofu writes provider secrets into state attributes in cleartext. */
             attributes: {
                 [key: string]: unknown;
             };
+            /** @description Attribute values were withheld; the names are complete. */
+            attributes_redacted?: boolean;
         };
         StateOutput: {
             name: string;
@@ -1523,6 +1533,8 @@ export interface components {
                 [key: string]: unknown;
             };
             changed_keys?: string[];
+            /** @description before/after values were withheld; the counts and changed_keys are the same ones a state manager sees. */
+            attributes_redacted?: boolean;
         };
         StateDiff: {
             added: number;
